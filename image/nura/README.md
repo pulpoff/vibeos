@@ -74,7 +74,7 @@ call, and WLAN goes down before the suspend, because its QMI traffic runs throug
 
 | Nura device | Phone | Checked |
 |---|---|---|
-| `oneplus-fajita` | OnePlus 6T | harness: A/B, the root as a partition (installed twice), nested and as an image file; QEMU boot: all five root kinds. Its zip is on [Releases](https://vibeos.top/releases) |
+| `oneplus-fajita` | OnePlus 6T | harness: A/B, the root as a partition (installed twice), nested and as an image file; QEMU boot: all five root kinds. Its zip is on [Releases](https://vibeos.top/releases). A newer mainline kernel: [fajita-mainline.md](fajita-mainline.md) |
 | `qcom-sm7150` with `--device xiaomi-surya --panel huaxing\|tianma` | POCO X3 NFC | harness: A-only, nested (installed twice) and partition; QEMU boot: nested |
 | `oneplus-enchilada` | OnePlus 6 | converted, report read |
 | `google-sargo` | Pixel 3a | converted, report read |
