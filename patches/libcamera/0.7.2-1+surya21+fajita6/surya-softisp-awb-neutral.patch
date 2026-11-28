@@ -1,0 +1,248 @@
+Index: libcamera-0.7.2/include/libcamera/internal/software_isp/swisp_stats.h
+===================================================================
+--- libcamera-0.7.2.orig/include/libcamera/internal/software_isp/swisp_stats.h
++++ libcamera-0.7.2/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -58,6 +58,13 @@ struct SwIspStats {
+ 	 * focus measure independent of brightness
+ 	 */
+ 	uint64_t sharpnessLevel;
++	/**
++	 * \brief Sums of colour channels of the sampled pixels that are near
++	 * neutral under the white balance gains in use (see
++	 * SwStatsCpu::setNeutralParams()), and how many there were
++	 */
++	RGB<uint64_t> sumNeutral_;
++	uint32_t neutralCount;
+ };
+ 
+ } /* namespace libcamera */
+Index: libcamera-0.7.2/include/libcamera/internal/software_isp/swstats_cpu.h
+===================================================================
+--- libcamera-0.7.2.orig/include/libcamera/internal/software_isp/swstats_cpu.h
++++ libcamera-0.7.2/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -57,6 +57,7 @@ public:
+ 	void startFrame(uint32_t frame);
+ 	void finishFrame(uint32_t frame, uint32_t bufferId);
+ 	void processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input);
++	void setNeutralParams(const RGB<float> &gains, float blackLevel);
+ 
+ 	void processLine0(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+ 	{
+@@ -125,6 +126,10 @@ private:
+ 	void sharpness10P(const uint8_t *frame, SwIspStats &stats);
+ 	bool sharpness10P_ = false;
+ 
++	/* white balance gains (8.8 fixed point, green 256) and black level (0..1) the ISP is using now */
++	unsigned int neutralGainR_ = 0, neutralGainB_ = 0;
++	float neutralBlack_ = 0.0f;
++
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+Index: libcamera-0.7.2/src/ipa/simple/algorithms/awb.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/algorithms/awb.cpp
++++ libcamera-0.7.2/src/ipa/simple/algorithms/awb.cpp
+@@ -26,6 +26,7 @@ namespace ipa::soft::algorithms {
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
++	startFrames_ = 0;
+ 	auto &gains = context.activeState.awb.gains;
+ 	gains = { { 1.0, 1.0, 1.0 } };
+ 
+@@ -73,7 +74,25 @@ void Awb::process(IPAContext &context,
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	/*
++	 * Near-neutral pixels (SwStatsCpu::setNeutralParams()) when at least 2%
++	 * of the samples are: white and grey things say what white is, a big
++	 * coloured surface does not. Otherwise the whole frame (grey world).
++	 */
++	/*
++	 * The first few estimates are the whole frame's, taken in full: which
++	 * pixels look neutral depends on the gains in use, and from the start
++	 * gains (1, 1) the neutral ones were mostly bluish, so the camera came
++	 * up yellow and crept to white over several seconds. From grey world,
++	 * near-neutral refinement starts close.
++	 */
++	const bool settling = startFrames_ < 3;
++	if (settling)
++		startFrames_++;
++	const bool neutral = !settling && stats->neutralCount > nPixels / 50;
++	const uint64_t offsetN = blackLevel * static_cast<uint64_t>(stats->neutralCount);
++	const RGB<uint64_t> sum = neutral ? stats->sumNeutral_.max(offsetN + minValid) - offsetN
++					  : stats->sum_.max(offset + minValid) - offset;
+ 
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+@@ -85,14 +104,15 @@ void Awb::process(IPAContext &context,
+ 
+ 	/*
+ 	 * Debian/Mobian on the POCO X3 NFC: the full grey-world correction
+-	 * turned a lamp-lit room blue-white and a yellow floor blue, and a
+-	 * fresh estimate on every frame let the colours jump on a noisy
+-	 * picture. Correct only part of the way, keep a little warmth, and
+-	 * move towards each new estimate slowly.
+-	 */
+-	constexpr float kStrength = 0.65f;
+-	constexpr float kWarmR = 1.05f, kWarmB = 0.92f;
+-	constexpr float kSmoothing = 0.15f;
++	 * turned a lamp-lit room blue-white and a yellow floor blue, so it was
++	 * applied only part of the way. From near-neutral pixels it is right,
++	 * and goes all the way (keeping a little warmth, as phones do); grey
++	 * world, the fallback, stays partial. A fresh estimate on every frame
++	 * let the colours jump on a noisy picture: they move towards it slowly.
++	 */
++	const float kStrength = neutral || settling ? 1.0f : 0.65f;
++	const float kWarmR = neutral ? 1.02f : 1.05f, kWarmB = neutral ? 0.97f : 0.92f;
++	const float kSmoothing = settling ? 1.0f : 0.3f;
+ 	const float targetR = (1.0f + kStrength * (greyR - 1.0f)) * kWarmR;
+ 	const float targetB = (1.0f + kStrength * (greyB - 1.0f)) * kWarmB;
+ 	gains = { {
+Index: libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/debayer_egl.cpp
++++ libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+@@ -635,6 +635,8 @@ void DebayerEGL::process(uint32_t frame,
+ 	std::optional<MappedFrameBuffer> inMapped;
+ 	std::optional<DmaSyncer> inDmaSyncer;
+ 
++	stats_->setNeutralParams(params.gains, params.blackLevel.g());
++
+ 	if (debayerGPU(input, output, params, &inMapped, &inDmaSyncer)) {
+ 		LOG(Debayer, Error) << "debayerGPU failed";
+ 		goto error;
+Index: libcamera-0.7.2/src/libcamera/software_isp/swstats_cpu.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/swstats_cpu.cpp
++++ libcamera-0.7.2/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cmath>
+ 
+@@ -180,7 +181,9 @@ static constexpr unsigned int kBlueYMul
+                                           \
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;
++	uint64_t sumB = 0;                \
++	uint64_t nR = 0, nG = 0, nB = 0;  \
++	uint32_t nCount = 0;
+ 
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+ 	sumR += r;                         \
+@@ -190,12 +193,41 @@ static constexpr unsigned int kBlueYMul
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+ 	yVal += b * kBlueYMul;             \
+-	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++; \
++	SWSTATS_NEUTRAL(div)
++
++/*
++ * Near-neutral pixels for the white balance: black-subtracted, neither dark nor near clipping, and with the gains in
++ * use within 25% of grey. A scene of one big colour (a blue folder filling the frame) then no longer pulls the white
++ * balance to its opposite: only what is already nearly white or grey says what white is.
++ */
++#define SWSTATS_NEUTRAL(div)                                                                  \
++	if (neutralGainR_) {                                                                  \
++		const int bl = static_cast<int>(neutralBlack_ * 255 * (div));                \
++		const int gg = static_cast<int>(g) - bl;                                      \
++		if (gg > 10 * (div) && static_cast<int>(g) < 235 * (div) &&                   \
++		    static_cast<int>(r) < 235 * (div) && static_cast<int>(b) < 235 * (div)) {  \
++			const int64_t rr = static_cast<int64_t>(static_cast<int>(r) - bl) * neutralGainR_; \
++			const int64_t bb = static_cast<int64_t>(static_cast<int>(b) - bl) * neutralGainB_; \
++			const int64_t g8 = static_cast<int64_t>(gg) * 256;                    \
++			const int64_t mx = std::max({ rr, g8, bb }), mn = std::min({ rr, g8, bb }); \
++			if (mn > 0 && mx * 4 < mn * 5) {                                      \
++				nR += r;                                                      \
++				nG += g;                                                      \
++				nB += b;                                                      \
++				nCount++;                                                     \
++			}                                                                     \
++		}                                                                             \
++	}
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+ 	stats.sum_.g() += sumG;     \
+-	stats.sum_.b() += sumB;
++	stats.sum_.b() += sumB;     \
++	stats.sumNeutral_.r() += nR; \
++	stats.sumNeutral_.g() += nG; \
++	stats.sumNeutral_.b() += nB; \
++	stats.neutralCount += nCount;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+@@ -394,6 +426,8 @@ void SwStatsCpu::startFrame(uint32_t fra
+ 
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.neutralCount = 0;
+ 		s.yHistogram.fill(0);
+ 		s.sharpness = 0;
+ 		s.sharpnessCount = 0;
+@@ -414,14 +448,19 @@ void SwStatsCpu::finishFrame(uint32_t fr
+ 
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->neutralCount = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->sumNeutral_ += s.sumNeutral_;
++			sharedStats_->neutralCount += s.neutralCount;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->sumNeutral_ >>= sumShift_;
+ 	}
+ 
+ 	/* the focus measure, valid on every frame it was taken on (sharpnessCount 0 otherwise) */
+@@ -593,6 +632,20 @@ void SwStatsCpu::setWindow(const Rectang
+ 	window_.height &= ~(patternSize_.height - 1);
+ }
+ 
++/**
++ * \brief Set the white balance the ISP applies now, for the near-neutral sums
++ * \param[in] gains The colour gains (any scale: only their ratios to green count)
++ * \param[in] blackLevel The black level, 0..1 of the full range
++ */
++void SwStatsCpu::setNeutralParams(const RGB<float> &gains, float blackLevel)
++{
++	if (gains.g() <= 0.0f)
++		return;
++	neutralGainR_ = static_cast<unsigned int>(256.0f * gains.r() / gains.g());
++	neutralGainB_ = static_cast<unsigned int>(256.0f * gains.b() / gains.g());
++	neutralBlack_ = blackLevel;
++}
++
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ {
+ 	const uint8_t *src = in.planes()[0].data();
+Index: libcamera-0.7.2/src/ipa/simple/algorithms/awb.h
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/algorithms/awb.h
++++ libcamera-0.7.2/src/ipa/simple/algorithms/awb.h
+@@ -29,6 +29,9 @@ public:
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	unsigned int startFrames_ = 0;	/* estimates taken since the stream started */
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
