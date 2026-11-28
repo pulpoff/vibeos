@@ -1,0 +1,71 @@
+From 300c05beecb33d80c1e0fc63e5423387a173a445 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 00:26:02 +0100
+Subject: [PATCH] bearer-qmi: limit the reported MTU to what the link accepts
+
+The kernel creates a multiplexed rmnet link with the largest MTU its main
+interface leaves room for: 1500 minus the MAP header, so 1496, or 1492
+with checksum offload, on the 1500 byte IPA interface of Qualcomm SoCs.
+The modem still reports an MTU of 1500 for the bearer. NetworkManager
+then fails to set it on the link, "setting MTU to requested size is not
+possible", at connect and again every 30 seconds.
+
+Read the link's MTU from sysfs and report that when the modem's value is
+larger, so the client applies an MTU the link can carry.
+
+Assisted-by: AI coding agent
+---
+ src/mm-bearer-qmi.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/mm-bearer-qmi.c b/src/mm-bearer-qmi.c
+index 90f7887..6233344 100644
+--- a/src/mm-bearer-qmi.c
++++ b/src/mm-bearer-qmi.c
+@@ -1003,6 +1003,35 @@ get_ipv6_config (MMBearerQmi *self,
+     return config;
+ }
+ 
++/* A multiplexed link is created with the largest MTU its main interface leaves
++ * room for, which can be less than the MTU the modem reports (e.g. 1496 or 1492
++ * on an rmnet link over a 1500 byte IPA interface). Reporting the modem's value
++ * makes the client fail to set it on the link, again on every reconfiguration,
++ * so report what the link accepts instead. */
++static guint32
++limit_mtu_to_link (MMBearerQmi *self,
++                   MMPort      *link,
++                   guint32      mtu)
++{
++    g_autofree gchar *path = NULL;
++    g_autofree gchar *contents = NULL;
++    guint             link_mtu = 0;
++
++    if (!mtu || !link)
++        return mtu;
++
++    path = g_strdup_printf ("/sys/class/net/%s/mtu", mm_port_get_device (link));
++    if (!g_file_get_contents (path, &contents, NULL, NULL) ||
++        !mm_get_uint_from_str (g_strstrip (contents), &link_mtu) ||
++        !link_mtu ||
++        mtu <= link_mtu)
++        return mtu;
++
++    mm_obj_msg (self, "MTU %u reported by the modem does not fit link %s, using its %u",
++                mtu, mm_port_get_device (link), link_mtu);
++    return link_mtu;
++}
++
+ static void
+ get_current_settings_ready (QmiClientWds *client,
+                             GAsyncResult *res,
+@@ -1061,6 +1090,7 @@ get_current_settings_ready (QmiClientWds *client,
+             mm_obj_dbg (self, "       MTU: failed (%s)", error->message);
+             g_clear_error (&error);
+         }
++        mtu = limit_mtu_to_link (self, ctx->link, mtu);
+ 
+         if (ip_family == QMI_WDS_IP_FAMILY_IPV4)
+             ctx->ipv4_config = get_ipv4_config (ctx->self, ctx->ip_method, output, mtu);
+-- 
+2.56.1
+

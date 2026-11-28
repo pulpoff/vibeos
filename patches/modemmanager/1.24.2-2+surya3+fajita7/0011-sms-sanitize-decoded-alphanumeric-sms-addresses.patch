@@ -1,0 +1,113 @@
+From 1ee3a443b12703fd69d7ff5e93d4f330231303b0 Mon Sep 17 00:00:00 2001
+From: Aleksander Morgado <aleksandermj@google.com>
+Date: Mon, 29 Jun 2026 16:49:48 +0000
+Subject: [PATCH] sms: sanitize decoded alphanumeric SMS addresses
+
+Alphanumeric SMS addresses decoded from GSM-7 could contain control
+characters (like CR/LF), which could lead to AT command injection
+if the address is later spliced into an AT+CMGS command during
+stored SMS send fallback.
+
+Sanitize the decoded address by removing all control characters.
+
+Introduce a common helper mm_utils_remove_control_characters() to
+remove control characters from a string in-place, and add unit
+tests for it.
+
+https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/work_items/1062
+
+Signed-off-by: Aleksander Morgado <aleksandermj@google.com>
+---
+--- a/src/mm-modem-helpers.c
++++ b/src/mm-modem-helpers.c
+@@ -5553,3 +5553,24 @@
+     }
+     return default_value;
+ }
++
++/*****************************************************************************/
++
++void
++mm_utils_remove_control_characters (gchar *str)
++{
++    gchar *src = str;
++    gchar *dst = str;
++
++    if (!str)
++        return;
++
++    while (*src) {
++        if (((guint8)*src) >= 0x20) {
++            *dst = *src;
++            dst++;
++        }
++        src++;
++    }
++    *dst = '\0';
++}
+--- a/src/mm-modem-helpers.h
++++ b/src/mm-modem-helpers.h
+@@ -552,6 +552,8 @@
+                                 guint16      *out_port,
+                                 GError      **error);
+ 
++void mm_utils_remove_control_characters (gchar *str);
++
+ gboolean mm_validate_cbs_channels (GArray   *channels,
+                                    GError  **error);
+ 
+--- a/src/mm-sms-part-3gpp.c
++++ b/src/mm-sms-part-3gpp.c
+@@ -28,6 +28,7 @@
+ #include "mm-sms-part-3gpp.h"
+ #include "mm-charsets.h"
+ #include "mm-log.h"
++#include "mm-modem-helpers.h"
+ 
+ #define PDU_SIZE 200
+ 
+@@ -141,6 +142,8 @@
+         unpacked = mm_charset_gsm_unpack (address, (len_digits * 4) / 7, 0, &unpacked_len);
+         unpacked_array = g_byte_array_new_take (unpacked, unpacked_len);
+         utf8 = mm_modem_charset_bytearray_to_utf8 (unpacked_array, MM_MODEM_CHARSET_GSM, FALSE, error);
++        if (utf8)
++            mm_utils_remove_control_characters (utf8);
+     } else if (addrtype == SMS_NUMBER_TYPE_INTL &&
+                addrplan == SMS_NUMBER_PLAN_TELEPHONE) {
+         /* International telphone number, format as "+1234567890" */
+--- a/src/tests/test-modem-helpers.c
++++ b/src/tests/test-modem-helpers.c
+@@ -4864,6 +4864,25 @@
+     }
+ }
+ 
++static void
++test_remove_control_characters (void *f, gpointer d)
++{
++    gchar str1[] = "hello\r\nworld";
++    gchar str2[] = "no_controls";
++    gchar str3[] = "\r\n\t";
++
++    mm_utils_remove_control_characters (str1);
++    g_assert_cmpstr (str1, ==, "helloworld");
++
++    mm_utils_remove_control_characters (str2);
++    g_assert_cmpstr (str2, ==, "no_controls");
++
++    mm_utils_remove_control_characters (str3);
++    g_assert_cmpstr (str3, ==, "");
++
++    mm_utils_remove_control_characters (NULL);
++}
++
+ /*****************************************************************************/
+ 
+ typedef struct {
+@@ -5126,6 +5145,7 @@
+     g_test_suite_add (suite, TESTCASE (test_bcd_to_string, NULL));
+ 
+     g_test_suite_add (suite, TESTCASE (test_at_quote_string, NULL));
++    g_test_suite_add (suite, TESTCASE (test_remove_control_characters, NULL));
+ 
+     g_test_suite_add (suite, TESTCASE (test_cpol_response, NULL));
+ 

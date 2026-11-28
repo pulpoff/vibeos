@@ -1,0 +1,27 @@
+From ef88093931ce93bea42571cd42ba6d24804b6fdc Mon Sep 17 00:00:00 2001
+From: Christian Wendt <cw@brainaid.dk>
+Date: Mon, 10 Aug 2026 08:53:00 +0200
+Subject: [PATCH] broadband-modem: Fix receiving multipart SMS from own number
+
+Signed-off-by: Christian Wendt <cw@brainaid.dk>
+---
+ src/mm-sms-list.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/mm-sms-list.c b/src/mm-sms-list.c
+index 30ce1cc4..2206e9d3 100644
+--- a/src/mm-sms-list.c
++++ b/src/mm-sms-list.c
+@@ -285,6 +285,9 @@ cmp_sms_by_number_reference (MMBaseSms *sms,
+     if (mm_base_sms_get_max_parts (sms) != mm_sms_part_get_concat_max (part))
+         return -1;
+ 
++    if (mm_gdbus_sms_get_pdu_type (MM_GDBUS_SMS (sms)) != mm_sms_part_get_pdu_type (part))
++        return -1;
++
+     return 0;
+ }
+ 
+-- 
+2.56.1
+

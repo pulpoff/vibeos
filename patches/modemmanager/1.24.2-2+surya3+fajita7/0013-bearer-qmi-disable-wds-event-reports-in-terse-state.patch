@@ -1,0 +1,124 @@
+From 88e17376c7896caa3072d17f8498cf953fddc23f Mon Sep 17 00:00:00 2001
+From: Michael Auer <mick@yoxcu.de>
+Date: Tue, 13 Oct 2026 21:28:24 +0000
+Subject: [PATCH 2/2] bearer-qmi: disable WDS event reports in terse state
+
+The QMI bearer enables the WDS event reports while connected, but
+only logs them. Some modems send them every few seconds (e.g. the
+SDM845 in the OnePlus 6: one indication every ~8 s per WDS client),
+and with quick suspend/resume each one wakes up the host.
+
+Disable the event reports in the terse state and enable them again
+on resume. The connection status is still tracked with the packet
+service status indications.
+
+Signed-off-by: Michael Auer <mick@yoxcu.de>
+---
+ src/mm-bearer-qmi.c | 85 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/src/mm-bearer-qmi.c b/src/mm-bearer-qmi.c
+index 64d983ebc..ee9ea411f 100644
+--- a/src/mm-bearer-qmi.c
++++ b/src/mm-bearer-qmi.c
+@@ -1565,6 +1565,89 @@ cleanup_event_report_unsolicited_events (MMBearerQmi *self,
+     qmi_message_wds_set_event_report_input_unref (input);
+ }
+ 
++#if defined WITH_SUSPEND_RESUME
++
++/*****************************************************************************/
++/* Terse state */
++
++static gboolean
++set_terse_finish (MMBaseBearer  *self,
++                  GAsyncResult  *res,
++                  GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++set_terse_event_report_ready (QmiClientWds *client,
++                              GAsyncResult *res,
++                              GTask        *task)
++{
++    QmiMessageWdsSetEventReportOutput *output;
++    GError                            *error = NULL;
++    guint                             *pending;
++
++    output = qmi_client_wds_set_event_report_finish (client, res, &error);
++    if (!output || !qmi_message_wds_set_event_report_output_get_result (output, &error)) {
++        mm_obj_warn (g_task_get_source_object (task), "couldn't update event report: %s", error->message);
++        g_error_free (error);
++    }
++    if (output)
++        qmi_message_wds_set_event_report_output_unref (output);
++
++    pending = g_task_get_task_data (task);
++    if (--(*pending) == 0)
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++set_terse (MMBaseBearer        *_self,
++           gboolean             terse,
++           GAsyncReadyCallback  callback,
++           gpointer             user_data)
++{
++    MMBearerQmi  *self = MM_BEARER_QMI (_self);
++    QmiClientWds *clients[2] = { NULL, NULL };
++    GTask        *task;
++    guint        *pending;
++    guint         i;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    pending = g_new0 (guint, 1);
++    g_task_set_task_data (task, pending, g_free);
++
++    /* The event reports are only logged, but some modems send them every
++     * few seconds, and each one wakes up a suspended host */
++    if (self->priv->event_report_ipv4_indication_id)
++        clients[0] = self->priv->client_ipv4;
++    if (self->priv->event_report_ipv6_indication_id)
++        clients[1] = self->priv->client_ipv6;
++
++    for (i = 0; i < G_N_ELEMENTS (clients); i++) {
++        QmiMessageWdsSetEventReportInput *input;
++
++        if (!clients[i])
++            continue;
++
++        (*pending)++;
++        input = event_report_input_new (!terse);
++        qmi_client_wds_set_event_report (clients[i],
++                                         input,
++                                         5,
++                                         NULL,
++                                         (GAsyncReadyCallback)set_terse_event_report_ready,
++                                         g_object_ref (task));
++        qmi_message_wds_set_event_report_input_unref (input);
++    }
++
++    if (*pending == 0)
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++#endif
++
+ static void
+ set_ip_family_ready (QmiClientWds *client,
+                      GAsyncResult *res,
+@@ -3015,5 +3098,7 @@ mm_bearer_qmi_class_init (MMBearerQmiClass *klass)
+ #if defined WITH_SUSPEND_RESUME
+     base_bearer_class->reload_connection_status = reload_connection_status;
+     base_bearer_class->reload_connection_status_finish = reload_connection_status_finish;
++    base_bearer_class->set_terse = set_terse;
++    base_bearer_class->set_terse_finish = set_terse_finish;
+ #endif
+ }
+-- 
+GitLab
+

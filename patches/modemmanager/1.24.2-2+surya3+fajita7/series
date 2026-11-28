@@ -1,0 +1,15 @@
+0001-qmi-retry-answer-while-call-in-setup.patch
+0002-generic-net-port-cgact.patch
+0003-generic-net-port-data.patch
+0004-base-manager-fix-cleanup-of-multiplexed-bearers.patch
+0005-netlink-fix-use-after-free-calling-completion_fn.patch
+0006-modemmanager-handle-qmi-dms-operating-mode-shuttin.patch
+0007-base-manager-fix-use-after-free-of-polkit-authenti.patch
+0008-shared-qmi-fix-uaf-on-duplicate-list-configs-indic.patch
+0009-ifaces-fix-uafs-in-signal-handlers-when-hot-unplug.patch
+0010-broadband-modem-fix-receiving-multipart-sms-from-o.patch
+0011-sms-sanitize-decoded-alphanumeric-sms-addresses.patch
+0012-base-bearer-broadband-modem-add-terse-state-to-bearers.patch
+0013-bearer-qmi-disable-wds-event-reports-in-terse-state.patch
+0014-broadband-modem-disable-profile-manager-events-in-terse.patch
+0015-bearer-qmi-limit-the-reported-mtu-to-the-link.patch

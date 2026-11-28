@@ -1,0 +1,354 @@
+From 772c58bdfabda95398f8a958de328b8722386d50 Mon Sep 17 00:00:00 2001
+From: Michael Auer <mick@yoxcu.de>
+Date: Tue, 13 Oct 2026 21:28:24 +0000
+Subject: [PATCH 1/2] base-bearer,broadband-modem: add terse state to bearers
+
+The terse state of quick suspend/resume only disables the 3GPP
+unsolicited events, but bearers may also have unsolicited reports
+enabled that wake up the suspended host.
+
+Add an optional set_terse() method to MMBaseBearer. It is run for
+all bearers as the last terse step of the modem, and undone as the
+last step of the bearer sync on resume.
+
+Signed-off-by: Michael Auer <mick@yoxcu.de>
+---
+ src/mm-base-bearer.c     | 78 ++++++++++++++++++++++++++++++++++++++++
+ src/mm-base-bearer.h     | 18 ++++++++++
+ src/mm-bearer-list.c     | 53 ++++++++++++++++++++++++---
+ src/mm-bearer-list.h     |  7 ++++
+ src/mm-broadband-modem.c | 37 +++++++++++++++++--
+ 5 files changed, 186 insertions(+), 7 deletions(-)
+
+diff --git a/src/mm-base-bearer.c b/src/mm-base-bearer.c
+index f9b868847..2f26440be 100644
+--- a/src/mm-base-bearer.c
++++ b/src/mm-base-bearer.c
+@@ -1596,6 +1596,7 @@ static void interface_syncing_step (GTask *task);
+ typedef enum {
+     SYNCING_STEP_FIRST,
+     SYNCING_STEP_REFRESH_CONNECTION,
++    SYNCING_STEP_LEAVE_TERSE,
+     SYNCING_STEP_LAST
+ } SyncingStep;
+ 
+@@ -1646,6 +1647,24 @@ reload_connection_status_ready (MMBaseBearer *self,
+     interface_syncing_step (task);
+ }
+ 
++static void
++leave_terse_ready (MMBaseBearer *self,
++                   GAsyncResult *res,
++                   GTask        *task)
++{
++    SyncingContext    *ctx;
++    g_autoptr(GError)  error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!MM_BASE_BEARER_GET_CLASS (self)->set_terse_finish (self, res, &error))
++        mm_obj_warn (self, "leaving terse state failed: %s", error->message);
++
++    /* Go on to the next step */
++    ctx->step++;
++    interface_syncing_step (task);
++}
++
+ static void
+ interface_syncing_step (GTask *task)
+ {
+@@ -1679,6 +1698,18 @@ interface_syncing_step (GTask *task)
+         ctx->step++;
+         /* fall through */
+ 
++    case SYNCING_STEP_LEAVE_TERSE:
++        if (MM_BASE_BEARER_GET_CLASS (self)->set_terse) {
++            mm_obj_dbg (self, "leaving terse state");
++            MM_BASE_BEARER_GET_CLASS (self)->set_terse (self,
++                                                        FALSE,
++                                                        (GAsyncReadyCallback) leave_terse_ready,
++                                                        task);
++            return;
++        }
++        ctx->step++;
++        /* fall through */
++
+     case SYNCING_STEP_LAST:
+         /* We are done without errors! */
+         g_task_return_boolean (task, TRUE);
+@@ -1711,6 +1742,53 @@ mm_base_bearer_sync (MMBaseBearer        *self,
+     interface_syncing_step (task);
+ }
+ 
++/*****************************************************************************/
++/* Terse */
++
++gboolean
++mm_base_bearer_terse_finish (MMBaseBearer  *self,
++                             GAsyncResult  *res,
++                             GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++set_terse_ready (MMBaseBearer *self,
++                 GAsyncResult *res,
++                 GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!MM_BASE_BEARER_GET_CLASS (self)->set_terse_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_base_bearer_terse (MMBaseBearer        *self,
++                      GAsyncReadyCallback  callback,
++                      gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (!MM_BASE_BEARER_GET_CLASS (self)->set_terse) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "entering terse state");
++    MM_BASE_BEARER_GET_CLASS (self)->set_terse (self,
++                                                TRUE,
++                                                (GAsyncReadyCallback) set_terse_ready,
++                                                task);
++}
++
+ #endif
+ 
+ /*****************************************************************************/
+diff --git a/src/mm-base-bearer.h b/src/mm-base-bearer.h
+index 336b44423..8e5117839 100644
+--- a/src/mm-base-bearer.h
++++ b/src/mm-base-bearer.h
+@@ -169,6 +169,16 @@ struct _MMBaseBearerClass {
+                                                                   GAsyncResult *res,
+                                                                   GError **error);
+ 
++    /* Enter or leave the terse state (optional): disable unsolicited
++     * reports not needed while the host is suspended */
++    void     (* set_terse)        (MMBaseBearer *bearer,
++                                   gboolean terse,
++                                   GAsyncReadyCallback callback,
++                                   gpointer user_data);
++    gboolean (* set_terse_finish) (MMBaseBearer *bearer,
++                                   GAsyncResult *res,
++                                   GError **error);
++
+ #endif
+ 
+     /* Reload statistics */
+@@ -236,6 +246,14 @@ gboolean mm_base_bearer_sync_finish (MMBaseBearer *self,
+                                      GAsyncResult *res,
+                                      GError **error);
+ 
++/* Terse Broadband Bearer (async) */
++void     mm_base_bearer_terse        (MMBaseBearer *self,
++                                      GAsyncReadyCallback callback,
++                                      gpointer user_data);
++gboolean mm_base_bearer_terse_finish (MMBaseBearer *self,
++                                      GAsyncResult *res,
++                                      GError **error);
++
+ #endif
+ 
+ #endif /* MM_BASE_BEARER_H */
+diff --git a/src/mm-bearer-list.c b/src/mm-bearer-list.c
+index 915dc1fb2..a06306f0b 100644
+--- a/src/mm-bearer-list.c
++++ b/src/mm-bearer-list.c
+@@ -296,6 +296,7 @@ mm_bearer_list_disconnect_bearers (MMBearerList        *self,
+ #if defined WITH_SUSPEND_RESUME
+ 
+ typedef struct {
++    gboolean      terse;
+     GList        *pending_to_sync;
+     MMBaseBearer *current_to_sync;
+ } SyncAllContext;
+@@ -317,6 +318,14 @@ mm_bearer_list_sync_all_bearers_finish (MMBearerList  *self,
+     return g_task_propagate_boolean (G_TASK (res), error);
+ }
+ 
++gboolean
++mm_bearer_list_terse_all_bearers_finish (MMBearerList  *self,
++                                         GAsyncResult  *res,
++                                         GError       **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
+ static void sync_next_bearer (GTask *task);
+ 
+ static void
+@@ -332,6 +341,19 @@ sync_ready (MMBaseBearer *bearer,
+     sync_next_bearer (task);
+ }
+ 
++static void
++terse_ready (MMBaseBearer *bearer,
++             GAsyncResult *res,
++             GTask        *task)
++{
++    g_autoptr(GError) error = NULL;
++
++    if (!mm_base_bearer_terse_finish (bearer, res, &error))
++        mm_obj_warn (bearer, "failed setting terse state: %s", error->message);
++
++    sync_next_bearer (task);
++}
++
+ static void
+ sync_next_bearer (GTask *task)
+ {
+@@ -351,18 +373,23 @@ sync_next_bearer (GTask *task)
+     ctx->current_to_sync = MM_BASE_BEARER (ctx->pending_to_sync->data);
+     ctx->pending_to_sync = g_list_delete_link (ctx->pending_to_sync, ctx->pending_to_sync);
+ 
+-    mm_base_bearer_sync (ctx->current_to_sync, (GAsyncReadyCallback)sync_ready, task);
++    if (ctx->terse)
++        mm_base_bearer_terse (ctx->current_to_sync, (GAsyncReadyCallback)terse_ready, task);
++    else
++        mm_base_bearer_sync (ctx->current_to_sync, (GAsyncReadyCallback)sync_ready, task);
+ }
+ 
+-void
+-mm_bearer_list_sync_all_bearers (MMBearerList        *self,
+-                                 GAsyncReadyCallback  callback,
+-                                 gpointer             user_data)
++static void
++sync_all_bearers (MMBearerList        *self,
++                  gboolean             terse,
++                  GAsyncReadyCallback  callback,
++                  gpointer             user_data)
+ {
+     SyncAllContext *ctx;
+     GTask          *task;
+ 
+     ctx = g_new0 (SyncAllContext, 1);
++    ctx->terse = terse;
+ 
+     /* Get a copy of the list */
+     ctx->pending_to_sync = g_list_copy_deep (self->priv->bearers,
+@@ -375,6 +402,22 @@ mm_bearer_list_sync_all_bearers (MMBearerList        *self,
+     sync_next_bearer (task);
+ }
+ 
++void
++mm_bearer_list_sync_all_bearers (MMBearerList        *self,
++                                 GAsyncReadyCallback  callback,
++                                 gpointer             user_data)
++{
++    sync_all_bearers (self, FALSE, callback, user_data);
++}
++
++void
++mm_bearer_list_terse_all_bearers (MMBearerList        *self,
++                                  GAsyncReadyCallback  callback,
++                                  gpointer             user_data)
++{
++    sync_all_bearers (self, TRUE, callback, user_data);
++}
++
+ #endif
+ 
+ /*****************************************************************************/
+diff --git a/src/mm-bearer-list.h b/src/mm-bearer-list.h
+index 9656ccf33..ee1ea9494 100644
+--- a/src/mm-bearer-list.h
++++ b/src/mm-bearer-list.h
+@@ -96,6 +96,13 @@ gboolean mm_bearer_list_sync_all_bearers_finish (MMBearerList *self,
+                                                  GAsyncResult *res,
+                                                  GError **error);
+ 
++void     mm_bearer_list_terse_all_bearers        (MMBearerList *self,
++                                                  GAsyncReadyCallback callback,
++                                                  gpointer user_data);
++gboolean mm_bearer_list_terse_all_bearers_finish (MMBearerList *self,
++                                                  GAsyncResult *res,
++                                                  GError **error);
++
+ #endif
+ 
+ #endif /* MM_BEARER_LIST_H */
+diff --git a/src/mm-broadband-modem.c b/src/mm-broadband-modem.c
+index 276a715ba..faf8efda7 100644
+--- a/src/mm-broadband-modem.c
++++ b/src/mm-broadband-modem.c
+@@ -13175,6 +13175,7 @@ synchronize (MMBaseModem         *self,
+ typedef enum {
+     TERSE_STEP_FIRST,
+     TERSE_STEP_DISABLE_UNSOLICITED_EVENTS_3GPP,
++    TERSE_STEP_BEARERS,
+     TERSE_STEP_LAST,
+ } TerseStep;
+ 
+@@ -13210,11 +13211,30 @@ iface_modem_3gpp_terse_ready (MMIfaceModem3gpp *self,
+     terse_step (task);
+ }
+ 
++static void
++terse_all_bearers_ready (MMBearerList *bearer_list,
++                         GAsyncResult *res,
++                         GTask        *task)
++{
++    TerseContext      *ctx;
++    g_autoptr(GError)  error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_bearer_list_terse_all_bearers_finish (bearer_list, res, &error))
++        mm_obj_warn (g_task_get_source_object (task), "setting terse state in bearers failed: %s", error->message);
++
++    /* Go on to next step */
++    ctx->step++;
++    terse_step (task);
++}
++
+ static void
+ terse_step (GTask *task)
+ {
+-    MMBroadbandModem *self;
+-    TerseContext     *ctx;
++    MMBroadbandModem        *self;
++    TerseContext            *ctx;
++    g_autoptr(MMBearerList)  bearer_list = NULL;
+ 
+     self = g_task_get_source_object (task);
+     ctx = g_task_get_task_data (task);
+@@ -13235,6 +13255,19 @@ terse_step (GTask *task)
+         ctx->step++;
+         /* fall through */
+ 
++    case TERSE_STEP_BEARERS:
++        g_object_get (self,
++                      MM_IFACE_MODEM_BEARER_LIST, &bearer_list,
++                      NULL);
++        if (bearer_list) {
++            mm_obj_msg (self, "terse state (%d/%d): bearers",
++                        ctx->step, TERSE_STEP_LAST);
++            mm_bearer_list_terse_all_bearers (bearer_list, (GAsyncReadyCallback)terse_all_bearers_ready, task);
++            return;
++        }
++        ctx->step++;
++        /* fall through */
++
+     case TERSE_STEP_LAST:
+         mm_obj_msg (self, "setting terse state (%d/%d): all done",
+                     ctx->step, TERSE_STEP_LAST);
+-- 
+GitLab
+
+

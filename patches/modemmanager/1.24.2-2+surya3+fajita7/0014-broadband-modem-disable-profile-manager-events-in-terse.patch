@@ -1,0 +1,271 @@
+From a775979bebdf6eb7a4e08a17f261be82909f65c4 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Fri, 27 Nov 2026 21:41:10 +0100
+Subject: [PATCH] broadband-modem: disable profile manager events in terse
+ state
+
+With --test-quick-suspend-resume the modem stays connected while the
+host sleeps. The QMI modem keeps the WDS "profile changed" indication
+registered, and the profile change that comes as a bearer is
+disconnected on sleep reaches the host right after it suspended. On a
+OnePlus 6T (SDM845, QMI over QRTR) it woke 3 of 4 suspends about 1 ms
+after entry.
+
+Disable the 3GPP profile manager unsolicited events as a terse step,
+enable them again in the resume sync and emit one "updated" signal
+there, since profiles may have changed meanwhile.
+
+Assisted-by: AI coding agent
+---
+ src/mm-broadband-modem.c                  | 64 +++++++++++++++
+ src/mm-iface-modem-3gpp-profile-manager.c | 97 +++++++++++++++++++++++
+ src/mm-iface-modem-3gpp-profile-manager.h | 18 +++++
+ 3 files changed, 179 insertions(+)
+
+diff --git a/src/mm-broadband-modem.c b/src/mm-broadband-modem.c
+index 7d2730e..2675a72 100644
+--- a/src/mm-broadband-modem.c
++++ b/src/mm-broadband-modem.c
+@@ -12968,6 +12968,7 @@ typedef enum {
+     SYNCING_STEP_NOTIFY,
+     SYNCING_STEP_IFACE_MODEM,
+     SYNCING_STEP_IFACE_3GPP,
++    SYNCING_STEP_IFACE_3GPP_PROFILE_MANAGER,
+     SYNCING_STEP_IFACE_TIME,
+     SYNCING_STEP_LAST,
+ } SyncingStep;
+@@ -13004,6 +13005,24 @@ iface_modem_time_sync_ready (MMIfaceModemTime *self,
+     syncing_step (task);
+ }
+ 
++static void
++iface_modem_3gpp_profile_manager_sync_ready (MMIfaceModem3gppProfileManager *self,
++                                             GAsyncResult                   *res,
++                                             GTask                          *task)
++{
++    SyncingContext    *ctx;
++    g_autoptr(GError)  error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_iface_modem_3gpp_profile_manager_sync_finish (self, res, &error))
++        mm_obj_warn (self, "3GPP profile manager interface synchronization failed: %s", error->message);
++
++    /* Go on to next step */
++    ctx->step++;
++    syncing_step (task);
++}
++
+ static void
+ iface_modem_3gpp_sync_ready (MMIfaceModem3gpp *self,
+                              GAsyncResult     *res,
+@@ -13111,6 +13130,19 @@ syncing_step (GTask *task)
+         ctx->step++;
+         /* fall through */
+ 
++    case SYNCING_STEP_IFACE_3GPP_PROFILE_MANAGER:
++        if (self->priv->modem_3gpp_profile_manager_dbus_skeleton &&
++            (self->priv->modem_state >= MM_MODEM_STATE_ENABLED)) {
++            mm_obj_msg (self, "resume synchronization state (%d/%d): 3GPP profile manager interface sync",
++                        ctx->step, SYNCING_STEP_LAST);
++            mm_iface_modem_3gpp_profile_manager_sync (MM_IFACE_MODEM_3GPP_PROFILE_MANAGER (self),
++                                                      (GAsyncReadyCallback)iface_modem_3gpp_profile_manager_sync_ready,
++                                                      task);
++            return;
++        }
++        ctx->step++;
++        /* fall through */
++
+     case SYNCING_STEP_IFACE_TIME:
+         /* Start Time interface synchronization, only if modem was enabled */
+         if (self->priv->modem_time_dbus_skeleton &&
+@@ -13161,6 +13193,7 @@ synchronize (MMBaseModem         *self,
+ typedef enum {
+     TERSE_STEP_FIRST,
+     TERSE_STEP_DISABLE_UNSOLICITED_EVENTS_3GPP,
++    TERSE_STEP_DISABLE_UNSOLICITED_EVENTS_3GPP_PROFILE_MANAGER,
+     TERSE_STEP_BEARERS,
+     TERSE_STEP_LAST,
+ } TerseStep;
+@@ -13197,6 +13230,24 @@ iface_modem_3gpp_terse_ready (MMIfaceModem3gpp *self,
+     terse_step (task);
+ }
+ 
++static void
++iface_modem_3gpp_profile_manager_terse_ready (MMIfaceModem3gppProfileManager *self,
++                                              GAsyncResult                   *res,
++                                              GTask                          *task)
++{
++    TerseContext      *ctx;
++    g_autoptr(GError)  error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_iface_modem_3gpp_profile_manager_terse_finish (self, res, &error))
++        mm_obj_warn (self, "3GPP profile manager interface terse failed: %s", error->message);
++
++    /* Go on to next step */
++    ctx->step++;
++    terse_step (task);
++}
++
+ static void
+ terse_all_bearers_ready (MMBearerList *bearer_list,
+                          GAsyncResult *res,
+@@ -13241,6 +13292,19 @@ terse_step (GTask *task)
+         ctx->step++;
+         /* fall through */
+ 
++    case TERSE_STEP_DISABLE_UNSOLICITED_EVENTS_3GPP_PROFILE_MANAGER:
++        if (self->priv->modem_3gpp_profile_manager_dbus_skeleton &&
++            (self->priv->modem_state >= MM_MODEM_STATE_ENABLED)) {
++            mm_obj_msg (self, "terse state (%d/%d): 3GPP profile manager interface disable unsolicited events",
++                        ctx->step, TERSE_STEP_LAST);
++            mm_iface_modem_3gpp_profile_manager_terse (MM_IFACE_MODEM_3GPP_PROFILE_MANAGER (self),
++                                                       (GAsyncReadyCallback)iface_modem_3gpp_profile_manager_terse_ready,
++                                                       task);
++            return;
++        }
++        ctx->step++;
++        /* fall through */
++
+     case TERSE_STEP_BEARERS:
+         g_object_get (self,
+                       MM_IFACE_MODEM_BEARER_LIST, &bearer_list,
+diff --git a/src/mm-iface-modem-3gpp-profile-manager.c b/src/mm-iface-modem-3gpp-profile-manager.c
+index d76202b..563ffde 100644
+--- a/src/mm-iface-modem-3gpp-profile-manager.c
++++ b/src/mm-iface-modem-3gpp-profile-manager.c
+@@ -1934,6 +1934,103 @@ mm_iface_modem_3gpp_profile_manager_initialize (MMIfaceModem3gppProfileManager *
+     interface_initialization_step (task);
+ }
+ 
++#if defined WITH_SUSPEND_RESUME
++
++gboolean
++mm_iface_modem_3gpp_profile_manager_terse_finish (MMIfaceModem3gppProfileManager  *self,
++                                                  GAsyncResult                    *res,
++                                                  GError                         **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++terse_disable_unsolicited_events_ready (MMIfaceModem3gppProfileManager *self,
++                                        GAsyncResult                   *res,
++                                        GTask                          *task)
++{
++    GError *error = NULL;
++
++    if (!MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->disable_unsolicited_events_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_iface_modem_3gpp_profile_manager_terse (MMIfaceModem3gppProfileManager *self,
++                                           GAsyncReadyCallback             callback,
++                                           gpointer                        user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (!MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->disable_unsolicited_events ||
++        !MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->disable_unsolicited_events_finish) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->disable_unsolicited_events (
++        self,
++        (GAsyncReadyCallback)terse_disable_unsolicited_events_ready,
++        task);
++}
++
++gboolean
++mm_iface_modem_3gpp_profile_manager_sync_finish (MMIfaceModem3gppProfileManager  *self,
++                                                 GAsyncResult                    *res,
++                                                 GError                         **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++sync_enable_unsolicited_events_ready (MMIfaceModem3gppProfileManager *self,
++                                      GAsyncResult                   *res,
++                                      GTask                          *task)
++{
++    GError *error = NULL;
++
++    if (!MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->enable_unsolicited_events_finish (self, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    /* Profiles may have changed while the events were disabled */
++    mm_iface_modem_3gpp_profile_manager_updated (self);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++void
++mm_iface_modem_3gpp_profile_manager_sync (MMIfaceModem3gppProfileManager *self,
++                                          GAsyncReadyCallback             callback,
++                                          gpointer                        user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (!MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->enable_unsolicited_events ||
++        !MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->enable_unsolicited_events_finish) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
++    MM_IFACE_MODEM_3GPP_PROFILE_MANAGER_GET_IFACE (self)->enable_unsolicited_events (
++        self,
++        (GAsyncReadyCallback)sync_enable_unsolicited_events_ready,
++        task);
++}
++
++#endif
++
+ void
+ mm_iface_modem_3gpp_profile_manager_shutdown (MMIfaceModem3gppProfileManager *self)
+ {
+diff --git a/src/mm-iface-modem-3gpp-profile-manager.h b/src/mm-iface-modem-3gpp-profile-manager.h
+index 7dfdc81..30faa81 100644
+--- a/src/mm-iface-modem-3gpp-profile-manager.h
++++ b/src/mm-iface-modem-3gpp-profile-manager.h
+@@ -211,6 +211,24 @@ gboolean mm_iface_modem_3gpp_profile_manager_disable_finish (MMIfaceModem3gppPro
+                                                              GError                         **error);
+ 
+ /* Shutdown profile manager interface */
++#if defined WITH_SUSPEND_RESUME
++
++/* Disable the unsolicited events while the host sleeps, and enable them again on resume (async) */
++void     mm_iface_modem_3gpp_profile_manager_terse        (MMIfaceModem3gppProfileManager  *self,
++                                                           GAsyncReadyCallback              callback,
++                                                           gpointer                         user_data);
++gboolean mm_iface_modem_3gpp_profile_manager_terse_finish (MMIfaceModem3gppProfileManager  *self,
++                                                           GAsyncResult                    *res,
++                                                           GError                         **error);
++void     mm_iface_modem_3gpp_profile_manager_sync         (MMIfaceModem3gppProfileManager  *self,
++                                                           GAsyncReadyCallback              callback,
++                                                           gpointer                         user_data);
++gboolean mm_iface_modem_3gpp_profile_manager_sync_finish  (MMIfaceModem3gppProfileManager  *self,
++                                                           GAsyncResult                    *res,
++                                                           GError                         **error);
++
++#endif
++
+ void mm_iface_modem_3gpp_profile_manager_shutdown (MMIfaceModem3gppProfileManager *self);
+ 
+ /* Bind properties for simple GetStatus() */

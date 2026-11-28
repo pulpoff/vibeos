@@ -1,0 +1,39 @@
+From 46a91399ca18e27b26e6ffc35f0b4bdf5cb14802 Mon Sep 17 00:00:00 2001
+From: Aleksander Morgado <aleksandermj@google.com>
+Date: Thu, 2 Jul 2026 17:00:13 +0000
+Subject: [PATCH] shared-qmi: fix UAF on duplicate list-configs indications
+
+Disconnect the 'list-configs' indication handler immediately inside the
+callback. If the modem sends a duplicate indication before the whole
+config load sequence completes, it could overwrite the stored
+'get-config-info' signal handler ID, orphaning the old handler and
+leading to a Use-After-Free when the GTask is completed and the
+orphaned handler eventually fires.
+
+https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/work_items/1071
+
+Signed-off-by: Aleksander Morgado <aleksandermj@google.com>
+---
+ src/mm-shared-qmi.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/mm-shared-qmi.c b/src/mm-shared-qmi.c
+index d93698a6..f4193b60 100644
+--- a/src/mm-shared-qmi.c
++++ b/src/mm-shared-qmi.c
+@@ -3111,6 +3111,12 @@ list_configs_indication (QmiClientPdc                      *client,
+     self = g_task_get_source_object (task);
+     ctx  = g_task_get_task_data (task);
+ 
++    /* Disconnect list-configs indication right away to avoid re-entry */
++    if (ctx->list_configs_indication_id) {
++        g_signal_handler_disconnect (ctx->client, ctx->list_configs_indication_id);
++        ctx->list_configs_indication_id = 0;
++    }
++
+     if (!qmi_indication_pdc_list_configs_output_get_indication_result (output, &error_code, &error)) {
+         load_carrier_config_abort (task, error);
+         return;
+-- 
+2.56.1
+
