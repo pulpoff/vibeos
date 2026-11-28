@@ -18,6 +18,7 @@ was checked against the build that made the shipped binaries; each README says h
 | [libcamera](libcamera/0.7.2-1+surya21/) (gstreamer1.0-libcamera) | 0.7.2-1+surya21 | Debian libcamera 0.7.2-1 | system image | LGPL-2.1-or-later |
 | [libcamera](libcamera/0.7.2-1+surya17/) | 0.7.2-1+surya17 | Debian libcamera 0.7.2-1 | POCO X3 NFC image | LGPL-2.1-or-later |
 | [libcamera](libcamera/0.7.2-1+gts4lv1/) | 0.7.2-1+gts4lv1 | Debian libcamera 0.7.2-1 | Galaxy Tab S5e image | LGPL-2.1-or-later |
+| [libcamera](libcamera/0.7.2-1+surya21+fajita1/) | 0.7.2-1+surya21+fajita1 | Debian libcamera 0.7.2-1 | not in an image yet (OnePlus 6T) | LGPL-2.1-or-later |
 | [webkit2gtk](webkit2gtk/2.54.2-2+neo1/) | 2.54.2-2+neo1 | Debian webkit2gtk 2.54.2-2 | system image | BSD-2-Clause (the files changed) |
 | [iio-sensor-proxy](iio-sensor-proxy/3.9-1+gts4lv3/) | 3.9-1+gts4lv3 | Debian iio-sensor-proxy 3.9-1 | Galaxy Tab S5e image, 0.1.4.3 | GPL-3 |
 | [iio-sensor-proxy](iio-sensor-proxy/3.9-1+vibeos1/) | 3.9-1+vibeos1 | Debian iio-sensor-proxy 3.9-1 | Galaxy Tab S5e image, 0.1.5 | GPL-3 |
