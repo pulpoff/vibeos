@@ -116,23 +116,31 @@ Phones with a header v3 or v4 boot image (a `vendor_boot` partition) are not sup
 ### OnePlus 6T: JumpLink's kernel 7.4
 
 For the 6T, the converter takes the kernel [JumpLink](https://github.com/JumpLink) builds for it instead of Nura's 7.1:
-release [fajita-7.4.0-rc2-1](https://github.com/JumpLink/linux-fajita/releases/tag/fajita-7.4.0-rc2-1) of
-[linux-fajita](https://github.com/JumpLink/linux-fajita) (sdm845-mainline with 17 commits for the 6T), its
-Image.gz-dtb and modules as released. A build of ours from the release's tag gave the same DTB byte for byte and the
-same 1180 modules at the same paths. The release is a pre-release: about 1 boot in 9 hangs, per the contributor.
+release [fajita-7.4.0-rc2-2](https://github.com/JumpLink/linux-fajita/releases/tag/fajita-7.4.0-rc2-2) of
+[linux-fajita](https://github.com/JumpLink/linux-fajita), its Image.gz-dtb and modules as released. The repository's CI
+builds it from branch `op6t-camera`: sdm845-mainline with the 6T's commits, since release 1 among them
+mojavemesa-lgtm's charger series, Lolren's fixes for the three camera sensors, the CAMSS interconnect votes from
+linux-media and an ath10k RFC. Its `SOURCE` names the commit and the run, and the converter puts it into the report.
+The CI's own boot image booted on one 6T by `fastboot boot`: the modem on LTE, WLAN, sound, all three cameras, a 60 s
+suspend, no module rejected. The release is a pre-release: release 1 hung at about 1 boot in 9, per the contributor,
+and release 2 is not counted yet.
 With it go JumpLink's ModemManager and NetworkManager changes for deep sleep with the modem on
 ([patches/modemmanager/1.24.2-2+surya3+fajita6](../../patches/modemmanager/1.24.2-2+surya3+fajita6/) and
 [patches/network-manager/1.58.1-1+fajita1](../../patches/network-manager/1.58.1-1+fajita1/)); in the contributor's
 measurements on the 6T, 4 of 4 suspends of 120 s reached deep sleep with both. VoLTE stays off (`mask 81voltd.service`).
+The release also has its own builds of these (ModemManager as +fajita7, #32 on top), libcamera 0.7.2-1+surya21+fajita10
+(#33 to #42) and tuning files for the three sensors; the zip does not carry the last two yet.
 
 ```sh
 image/nura/nura-to-vibeos --kernel KDIR --device-debs DEBS --cmdline-add fw_devlink.sync_state=timeout \
     …-oneplus-fajita-boot.img.xz …-oneplus-fajita.img.xz
 ```
 
-KDIR is the release's `Image.gz-dtb-*`, `config-*` and `SHA256SUMS` with its modules tar unpacked; DEBS the
-ModemManager (`modemmanager`, `libmm-glib0`, `gir1.2-modemmanager-1.0`) and NetworkManager (`network-manager`,
-`libnm0`, `gir1.2-nm-1.0`, `network-manager-tui`, `network-manager-l10n`) built from those two folders.
+KDIR is the release's `Image.gz-dtb-*`, `config-*`, `SOURCE` and `SHA256SUMS` with its modules tar unpacked (into
+`7.4.0-rc2-sdm845-g381388ba7548/`, as the tar holds it; `SHA256SUMS` also names the release's other files, which KDIR
+need not hold); DEBS the ModemManager (`modemmanager`, `libmm-glib0`, `gir1.2-modemmanager-1.0`) and NetworkManager
+(`network-manager`, `libnm0`, `gir1.2-nm-1.0`, `network-manager-tui`, `network-manager-l10n`) built from those two
+folders.
 `fw_devlink.sync_state=timeout` is on the release's own command line: without it a provider (an interconnect, a power
 domain) with a consumer that never probes keeps the bootloader's settings, and its power on.
 
