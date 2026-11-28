@@ -1,0 +1,141 @@
+From b8272c85a7d533541e16ca9e36b64ff4013d6f72 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 10:25:23 +0100
+Subject: [PATCH 1/2] ipa: simple: awb: Settle on a well exposed frame
+
+The near-neutral refinement only counts pixels that look grey under the
+gains in use, so with the gains more than 25% off the true greys drop
+out and the rest confirm the wrong gains. On the OnePlus 6T the second
+rear camera came up yellow-green that way and stayed there: the auto
+exposure starts from its shortest exposure, settling took its grey
+world estimates from frames a few levels above black, and set a blue
+gain of 1.27 where a well exposed frame gives 1.75.
+
+Settle only on frames whose green averages at least 24 levels above
+black, or after 30 frames that stay darker, count only applied
+estimates, and settle anew from grey world when few pixels are neutral
+and grey world disagrees by more than the window for 30 frames. Log the
+level and the share of neutral pixels with the gains.
+---
+ src/ipa/simple/algorithms/awb.cpp | 57 +++++++++++++++++++++++++++++--
+ src/ipa/simple/algorithms/awb.h   |  7 ++++
+ 2 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index fc9904b..fb30288 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -28,6 +28,8 @@ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+ 	startFrames_ = 0;
++	settleWait_ = 0;
++	lockedFrames_ = 0;
+ 	auto &gains = context.activeState.awb.gains;
+ 	gains = { { 1.0, 1.0, 1.0 } };
+ 
+@@ -88,8 +90,6 @@ void Awb::process(IPAContext &context,
+ 	 * near-neutral refinement starts close.
+ 	 */
+ 	const bool settling = startFrames_ < 3;
+-	if (settling)
+-		startFrames_++;
+ 	const bool neutral = !settling && stats->neutralCount > nPixels / 50;
+ 	const uint64_t offsetN = blackLevel * static_cast<uint64_t>(stats->neutralCount);
+ 	const RGB<uint64_t> sum = neutral ? stats->sumNeutral_.max(offsetN + minValid) - offsetN
+@@ -109,6 +109,26 @@ void Awb::process(IPAContext &context,
+ 		return;
+ 	}
+ 
++	/*
++	 * Only a well exposed frame counts towards settling. On the OnePlus 6T
++	 * the auto exposure starts from its shortest exposure: the first frames
++	 * sat a few levels above black, where a black level off by one level
++	 * moves the ratios by a third, and the second rear camera settled at a
++	 * blue gain of 1.27 against 1.75 from a well exposed frame. The
++	 * near-neutral refinement never left it. A scene that stays dark (the
++	 * longest exposure at night) settles after kSettleWaitFrames anyway.
++	 */
++	if (settling) {
++		const bool exposed = sum.g() >= count * kSettleMinLevel;
++		if (!exposed && settleWait_ < kSettleWaitFrames) {
++			settleWait_++;
++			LOG(IPASoftAwb, Debug)
++				<< "green " << sum.g() / count << " above black, too dark to settle";
++			return;
++		}
++		startFrames_++;
++	}
++
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+ 	 * Clamp the gains to 1/4 .. 4, this also avoids 0 division.
+@@ -125,6 +145,34 @@ void Awb::process(IPAContext &context,
+ 	 * world, the fallback, stays partial. A fresh estimate on every frame
+ 	 * let the colours jump on a noisy picture: they move towards it slowly.
+ 	 */
++	/*
++	 * Near-neutral refinement has a second, wrong resting point: with the
++	 * gains more than 25% off, the true greys fail the near-neutral test and
++	 * the pixels that pass confirm the gains in use. The OnePlus 6T's second
++	 * rear camera came up yellow-green that way (blue gain 1.05, grey world
++	 * 1.7) with 7% of the frame neutral against 43% at the right gains, and
++	 * stayed there. When few pixels are neutral and grey world disagrees by
++	 * more than the near-neutral window for about a second, settle anew from
++	 * grey world.
++	 */
++	if (neutral) {
++		const RGB<uint64_t> all = stats->sum_.max(offset + minValid) - offset;
++		const float worldR = static_cast<float>(all.g()) / all.r();
++		const float worldB = static_cast<float>(all.g()) / all.b();
++		const float off = std::max({ worldR / gains.r(), gains.r() / worldR,
++					     worldB / gains.b(), gains.b() / worldB });
++		if (off > 1.25f && stats->neutralCount < nPixels / 10)
++			lockedFrames_++;
++		else
++			lockedFrames_ = 0;
++		if (lockedFrames_ >= kLockedFrames) {
++			LOG(IPASoftAwb, Debug) << "near-neutral estimate stuck, settling from grey world";
++			lockedFrames_ = 0;
++			startFrames_ = 0;
++			settleWait_ = kSettleWaitFrames;
++		}
++	}
++
+ 	const float kStrength = neutral || settling ? 1.0f : 0.65f;
+ 	const float kWarmR = neutral ? 1.02f : 1.05f, kWarmB = neutral ? 0.97f : 0.92f;
+ 	const float kSmoothing = settling ? 1.0f : 0.3f;
+@@ -142,7 +190,10 @@ void Awb::process(IPAContext &context,
+ 
+ 	LOG(IPASoftAwb, Debug)
+ 		<< "gain R/B: " << gains << "; temperature: "
+-		<< context.activeState.awb.temperatureK;
++		<< context.activeState.awb.temperatureK
++		<< "; green " << sum.g() / count << " above black, "
++		<< (neutral ? "near-neutral " : (settling ? "settling " : "grey world "))
++		<< 100 * stats->neutralCount / nPixels << "% neutral";
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Awb, "Awb")
+diff --git a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+index ae662e8..ee569c3 100644
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -31,7 +31,14 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
++	static constexpr unsigned int kLockedFrames = 30;
++	/* mean green above black, in 8-bit levels, for a frame to settle on */
++	static constexpr uint64_t kSettleMinLevel = 24;
++	static constexpr unsigned int kSettleWaitFrames = 30;
++
+ 	unsigned int startFrames_ = 0;	/* estimates taken since the stream started */
++	unsigned int settleWait_ = 0;	/* frames too dark to settle on */
++	unsigned int lockedFrames_ = 0;	/* frames the near-neutral estimate looked stuck */
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+-- 
+2.56.1
+

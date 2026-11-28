@@ -1,0 +1,122 @@
+Index: libcamera-0.7.2/include/libcamera/internal/egl.h
+===================================================================
+--- libcamera-0.7.2.orig/include/libcamera/internal/egl.h
++++ libcamera-0.7.2/include/libcamera/internal/egl.h
+@@ -103,6 +103,7 @@ public:
+ 	~eGL();
+ 
+ 	int initEGLContext();
++	void cleanUp();
+ 	static bool isAvailable();
+ 
+ 	int createInputDMABufTexture2D(eGLImage &eglImage, int fd);
+Index: libcamera-0.7.2/src/libcamera/egl.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/egl.cpp
++++ libcamera-0.7.2/src/libcamera/egl.cpp
+@@ -12,6 +12,7 @@
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <mutex>
+ #include <unistd.h>
+ 
+ #include <linux/dma-buf.h>
+@@ -62,6 +63,14 @@ LOG_DEFINE_CATEGORY(eGL)
+  *\brief EGL sufrace handle
+  */
+ 
++/*
++ * The surfaceless display is one per process (eglGetPlatformDisplay returns the same handle every time), and
++ * eglInitialize/eglTerminate do not count: terminate it while another camera streams and that one loses its GPU.
++ * The streams using it are counted here and the last one to stop terminates it.
++ */
++static std::mutex displayUsersLock;
++static unsigned int displayUsers;
++
+ /**
+  * \brief Construct an EGL helper
+  *
+@@ -79,11 +88,36 @@ eGL::eGL()
+  */
+ eGL::~eGL()
+ {
++	cleanUp();
++}
++
++/**
++ * \brief Release the context, the surface and, with the last user, the display
++ *
++ * Called when the stream stops (on the thread the context was made on). Without it each start() created another
++ * context and none was ever destroyed: a session manager hosting the cameras (WirePlumber) kept 250 MB of GPU
++ * memory after the camera app had closed, and more with every opening.
++ */
++void eGL::cleanUp()
++{
++	if (display_ == EGL_NO_DISPLAY)
++		return;
++
++	eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+ 	if (context_ != EGL_NO_CONTEXT)
+ 		eglDestroyContext(display_, context_);
+-
+ 	if (surface_ != EGL_NO_SURFACE)
+ 		eglDestroySurface(display_, surface_);
++	context_ = EGL_NO_CONTEXT;
++	surface_ = EGL_NO_SURFACE;
++
++	{
++		std::lock_guard<std::mutex> lock(displayUsersLock);
++		if (displayUsers && --displayUsers == 0)
++			eglTerminate(display_);
++	}
++	eglReleaseThread();
++	display_ = EGL_NO_DISPLAY;
+ }
+ 
+ /**
+@@ -335,11 +369,13 @@ EGLDisplay eGL::probeDisplay()
+  */
+ bool eGL::isAvailable()
+ {
++	std::lock_guard<std::mutex> lock(displayUsersLock);
+ 	EGLDisplay display = probeDisplay();
+ 	if (display == EGL_NO_DISPLAY)
+ 		return false;
+ 
+-	eglTerminate(display);
++	if (!displayUsers)	/* a camera streaming on it keeps it */
++		eglTerminate(display);
+ 	return true;
+ }
+ 
+@@ -403,7 +439,14 @@ int eGL::initEGLContext()
+ 	EGLint numConfigs;
+ 	EGLConfig config;
+ 
+-	display_ = probeDisplay();
++	cleanUp();		/* a restart: the previous context goes first */
++
++	{
++		std::lock_guard<std::mutex> lock(displayUsersLock);
++		display_ = probeDisplay();
++		if (display_ != EGL_NO_DISPLAY)
++			displayUsers++;
++	}
+ 	if (display_ == EGL_NO_DISPLAY) {
+ 		LOG(eGL, Error) << "Unable to probe display";
+ 		goto fail;
+Index: libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/debayer_egl.cpp
++++ libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+@@ -698,6 +698,9 @@ void DebayerEGL::stop()
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
++	programId_ = 0;
++
++	egl_.cleanUp();
+ }
+ 
+ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)

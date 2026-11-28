@@ -1,0 +1,32 @@
+Index: libcamera-0.7.2/src/ipa/simple/algorithms/agc.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/algorithms/agc.cpp
++++ libcamera-0.7.2/src/ipa/simple/algorithms/agc.cpp
+@@ -65,6 +65,9 @@ static constexpr float kExpProportionalG
+  */
+ /* smaller steps: the picture flickered as the exposure chased the noise */
+ static constexpr float kExpMaxStep = 0.06;
++/* and when the exposure is far off (error above 1 of the 5-bin MSV scale) */
++static constexpr float kExpMaxStepFar = 0.25;
++static constexpr float kExpProportionalGainFar = 0.12;
+ 
+ /* the most digital gain the ISP adds on top of the sensor's longest exposure and highest gain */
+ static constexpr double kMaxDigitalGain = 4.0;
+@@ -88,8 +91,15 @@ void Agc::updateExposure(IPAContext &con
+ 	 * determines the direction: positive error means too dark (increase),
+ 	 * negative means too bright (decrease).
+ 	 */
+-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
+-				-kExpMaxStep, kExpMaxStep);
++	/*
++	 * Near the target the steps stay small (the picture flickered as the
++	 * exposure chased the noise); far from it (a turn from a dark corner to
++	 * a window) they may be large, or the picture took 5 s and more to
++	 * come right at 6% a step.
++	 */
++	const float maxStep = std::abs(error) > 1.0 ? kExpMaxStepFar : kExpMaxStep;
++	const float gainP = std::abs(error) > 1.0 ? kExpProportionalGainFar : kExpProportionalGain;
++	float step = std::clamp(static_cast<float>(error) * gainP, -maxStep, maxStep);
+ 	float factor = 1.0f + step;
+ 
+ 	double &digital = context.activeState.agc.digitalGain;

@@ -1,0 +1,130 @@
+Description: soft ISP: gentler auto exposure and white balance
+ On the POCO X3 NFC (Mobian) the soft ISP's grey-world white balance turned a
+ lamp-lit room blue-white and a yellow floor blue, and with a fresh estimate on
+ every frame the colours jumped on a noisy picture; the exposure aimed for the
+ middle of the range, which came out washed out after the gamma curve, and
+ chased the noise in 15 % steps (flicker). White balance now corrects 65 % of
+ the way with a slight warm bias and moves 15 % per frame towards the new
+ estimate; exposure aims a little lower in steps of at most 6 %. When the
+ sensor is at its longest exposure and highest gain and the picture is still
+ dark, the ISP adds up to 4x digital gain (on the colour gains) and takes it
+ back first when the picture gets too bright.
+Author: pulpoff <pashkovsky@gmail.com>
+Forwarded: no
+---
+--- a/src/ipa/simple/algorithms/agc.cpp	2026-10-10 00:32:22.559814554 +0200
++++ b/src/ipa/simple/algorithms/agc.cpp	2026-10-10 00:52:44.798432743 +0200
+@@ -30,7 +30,11 @@
+  * The exposure is optimal when the mean sample value of the histogram is
+  * in the middle of the range.
+  */
+-static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
++/*
++ * Debian/Mobian on the POCO X3 NFC: the middle of the range came out washed
++ * out once the picture had passed the gamma curve; a little below it.
++ */
++static constexpr float kExposureOptimal = 2.0;
+ 
+ /*
+  * This implements the hysteresis for the exposure adjustment.
+@@ -59,7 +63,11 @@
+  * Maximum multiplicative step per frame, to bound the correction when the
+  * scene changes dramatically.
+  */
+-static constexpr float kExpMaxStep = 0.15;
++/* smaller steps: the picture flickered as the exposure chased the noise */
++static constexpr float kExpMaxStep = 0.06;
++
++/* the most digital gain the ISP adds on top of the sensor's longest exposure and highest gain */
++static constexpr double kMaxDigitalGain = 4.0;
+ 
+ Agc::Agc()
+ {
+@@ -84,9 +92,19 @@
+ 				-kExpMaxStep, kExpMaxStep);
+ 	float factor = 1.0f + step;
+ 
++	double &digital = context.activeState.agc.digitalGain;
++
+ 	if (factor > 1.0f) {
+ 		/* Scene too dark: increase exposure first, then gain. */
+-		if (exposure < context.configuration.agc.exposureMax) {
++		if (exposure >= context.configuration.agc.exposureMax &&
++		    again >= context.configuration.agc.againMax) {
++			/*
++			 * Debian/Mobian on the POCO X3 NFC: the macro camera
++			 * stayed dark indoors at the sensor's longest exposure
++			 * and highest gain: then the ISP adds up to 4x.
++			 */
++			digital = std::min(digital * factor, kMaxDigitalGain);
++		} else if (exposure < context.configuration.agc.exposureMax) {
+ 			int32_t next = static_cast<int32_t>(exposure * factor);
+ 			exposure = std::max(next, exposure + 1);
+ 		} else {
+@@ -97,8 +115,10 @@
+ 				again = next;
+ 		}
+ 	} else {
+-		/* Scene too bright: decrease gain first, then exposure. */
+-		if (again > context.configuration.agc.again10) {
++		/* Scene too bright: the ISP's digital gain goes first, then gain, then exposure. */
++		if (digital > 1.0) {
++			digital = std::max(digital * factor, 1.0);
++		} else if (again > context.configuration.agc.again10) {
+ 			double next = again * factor;
+ 			if (again - next < context.configuration.agc.againMinStep)
+ 				again -= context.configuration.agc.againMinStep;
+--- a/src/ipa/simple/algorithms/awb.cpp	2026-10-10 00:32:22.819816159 +0200
++++ b/src/ipa/simple/algorithms/awb.cpp	2026-10-10 00:52:44.798503105 +0200
+@@ -38,9 +38,11 @@
+ 		  DebayerParams *params)
+ {
+ 	auto &gains = context.activeState.awb.gains;
++	/* the auto exposure's digital gain rides on the colour gains */
++	const float digital = context.activeState.agc.digitalGain;
+ 
+ 	frameContext.gains = gains;
+-	params->gains = gains;
++	params->gains = { { gains.r() * digital, gains.g() * digital, gains.b() * digital } };
+ }
+ 
+ void Awb::process(IPAContext &context,
+@@ -78,10 +80,25 @@
+ 	 * Clamp max gain at 4.0, this also avoids 0 division.
+ 	 */
+ 	auto &gains = context.activeState.awb.gains;
++	const float greyR = sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r();
++	const float greyB = sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b();
++
++	/*
++	 * Debian/Mobian on the POCO X3 NFC: the full grey-world correction
++	 * turned a lamp-lit room blue-white and a yellow floor blue, and a
++	 * fresh estimate on every frame let the colours jump on a noisy
++	 * picture. Correct only part of the way, keep a little warmth, and
++	 * move towards each new estimate slowly.
++	 */
++	constexpr float kStrength = 0.65f;
++	constexpr float kWarmR = 1.05f, kWarmB = 0.92f;
++	constexpr float kSmoothing = 0.15f;
++	const float targetR = (1.0f + kStrength * (greyR - 1.0f)) * kWarmR;
++	const float targetB = (1.0f + kStrength * (greyB - 1.0f)) * kWarmB;
+ 	gains = { {
+-		sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
++		gains.r() + kSmoothing * (targetR - gains.r()),
+ 		1.0,
+-		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
++		gains.b() + kSmoothing * (targetB - gains.b()),
+ 	} };
+ 
+ 	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+--- a/src/ipa/simple/ipa_context.h	2026-10-10 00:52:44.710009145 +0200
++++ b/src/ipa/simple/ipa_context.h	2026-10-10 00:52:44.798313115 +0200
+@@ -40,6 +40,8 @@
+ 		int32_t exposure;
+ 		double again;
+ 		bool valid;
++		/* applied by the ISP when exposure and analogue gain are at their maximum */
++		double digitalGain = 1.0;
+ 	} agc;
+ 
+ 	struct {

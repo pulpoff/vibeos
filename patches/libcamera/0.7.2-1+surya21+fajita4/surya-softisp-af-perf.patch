@@ -1,0 +1,50 @@
+Index: libcamera-0.7.2/include/libcamera/internal/software_isp/debayer_params.h
+===================================================================
+--- libcamera-0.7.2.orig/include/libcamera/internal/software_isp/debayer_params.h
++++ libcamera-0.7.2/include/libcamera/internal/software_isp/debayer_params.h
+@@ -25,6 +25,13 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++
++	/*
++	 * Autofocus is scanning: the focus measure is wanted on every frame,
++	 * not only on the statistics frames. Mapping and syncing a 20 MB raw
++	 * frame for it on every frame cost 7 ms a frame, all the time.
++	 */
++	bool focusEveryFrame = false;
+ };
+ 
+ } /* namespace libcamera */
+Index: libcamera-0.7.2/src/ipa/simple/soft_simple.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/soft_simple.cpp
++++ libcamera-0.7.2/src/ipa/simple/soft_simple.cpp
+@@ -311,6 +311,7 @@ void IPASoftSimple::computeParams(const
+ 	for (const auto &algo : algorithms())
+ 		algo->prepare(context_, frame, frameContext, params_);
+ 	params_->combinedMatrix = context_.activeState.combinedMatrix;
++	params_->focusEveryFrame = context_.activeState.lens.scanning;
+ 
+ 	setIspParams.emit();
+ }
+Index: libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/debayer_egl.cpp
++++ libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+@@ -652,10 +652,12 @@ void DebayerEGL::process(uint32_t frame,
+ 	metadata.planes()[0].bytesused = output->planes()[0].length;
+ 
+ 	/*
+-	 * Calculate stats for the whole frame: the full set on every kStatPerNumFrames-th frame, the autofocus measure
+-	 * on the others (processFrame() sorts that out; it needs the frame mapped too)
++	 * Calculate stats for the whole frame: the full set on every kStatPerNumFrames-th frame, and while autofocus
++	 * scans the focus measure on the others too (processFrame() sorts that out; it needs the frame mapped)
+ 	 */
+-	{
++	if (frame % SwStatsCpu::kStatPerNumFrames && !params.focusEveryFrame) {
++		stats_->finishFrame(frame, 0);
++	} else {
+ 		if (!inMapped) {
+ 			/*
+ 			 * The buffer was directly imported into EGL and thus
