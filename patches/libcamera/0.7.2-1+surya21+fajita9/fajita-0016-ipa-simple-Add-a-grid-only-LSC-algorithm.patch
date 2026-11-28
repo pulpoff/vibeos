@@ -1,0 +1,585 @@
+From cee78c8e4730e8235ac3cccf79c5c73a282be612 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 14:24:01 +0100
+Subject: [PATCH 16/16] ipa: simple: Add a grid-only LSC algorithm
+
+Upstream builds its LSC algorithm on libipa's LscAlgorithm, which
+needs about two dozen libipa and rkisp1 commits. Instead of
+backporting that chain, add a self-contained Lsc algorithm that reads
+the same tuning format ("Lsc: sets: - ct, r, g, b", type "table",
+17x17 grids of UQ<2, 6> values, 64 = 1.0) and interpolates between
+the sets by colour temperature, updating the table only on changes of
+100 K or more. LensShadingCorrectionEnable switches it off, which
+passes the identity table to the debayer. Polynomial grids are not
+supported.
+
+The design and the way the table reaches the shader follow the
+upstream work by Xander Pronk, Rick ten Wolde and Milan Zamazal.
+
+Add identityLscLut to DebayerParams (from upstream 18b1542) and a
+test that loads two sets through the algorithm and checks the
+identity, the interpolation, the clamping, the 100 K threshold and
+the disable control.
+
+Assisted-by: AI coding agent
+---
+ .../internal/software_isp/debayer_params.h    |  12 +-
+ src/ipa/simple/algorithms/lsc.cpp             | 188 ++++++++++++++++++
+ src/ipa/simple/algorithms/lsc.h               |  53 +++++
+ src/ipa/simple/algorithms/meson.build         |   1 +
+ src/ipa/simple/ipa_context.h                  |   8 +
+ src/ipa/simple/soft_simple.cpp                |   2 +
+ src/libcamera/software_isp/debayer.cpp        |   8 +
+ test/ipa/meson.build                          |  12 +-
+ test/ipa/soft_simple_lsc.cpp                  | 166 ++++++++++++++++
+ 9 files changed, 448 insertions(+), 2 deletions(-)
+ create mode 100644 src/ipa/simple/algorithms/lsc.cpp
+ create mode 100644 src/ipa/simple/algorithms/lsc.h
+ create mode 100644 test/ipa/soft_simple_lsc.cpp
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 00ac3c6..f7e8977 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -45,7 +45,17 @@ struct DebayerParams {
+ 		kLscValuesPerCell * sizeof(uint8_t);
+ 	using LscLookupTable =
+ 		std::array<uint8_t, kLscGridSize * kLscGridSize * kLscValuesPerCell>;
+-	alignas(4) LscLookupTable lscLut{};
++	static constexpr auto identityLscLut = [] {
++		LscLookupTable lut = {};
++		/* lut.fill(64) could be used, but it fails with older gcc versions */
++		for (size_t i = 0; kLscValuesPerCell * i < lut.size(); i++) {
++			lut[i * kLscValuesPerCell + 0] = 64; /* == UQ<2, 6>(1.0f).quantized() */
++			lut[i * kLscValuesPerCell + 1] = 64;
++			lut[i * kLscValuesPerCell + 2] = 64;
++		}
++		return lut;
++	}();
++	alignas(4) LscLookupTable lscLut = identityLscLut;
+ 	uint64_t lscLutVersion = 0;
+ };
+ 
+diff --git a/src/ipa/simple/algorithms/lsc.cpp b/src/ipa/simple/algorithms/lsc.cpp
+new file mode 100644
+index 0000000..c9d0bc2
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.cpp
+@@ -0,0 +1,188 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Lens shading correction
++ *
++ * The tuning file format and the way the grids reach the shader follow the
++ * upstream libcamera LSC algorithm by Xander Pronk, Rick ten Wolde and
++ * Milan Zamazal. This version does not use libipa's LscAlgorithm and
++ * supports tabular grids only.
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/control_ids.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++namespace {
++
++constexpr unsigned int kGridSize = DebayerParams::kLscGridSize;
++constexpr unsigned int kTemperatureThreshold = 100;
++constexpr const char *kChannels[3] = { "r", "g", "b" };
++
++} /* namespace */
++
++int Lsc::init(IPAContext &context, const ValueNode &tuningData)
++{
++	const std::string type = tuningData["type"].get<std::string>("table");
++	if (type != "table") {
++		LOG(IPASoftLsc, Error)
++			<< "Unsupported Lsc type '" << type << "'";
++		return -EINVAL;
++	}
++
++	const ValueNode &sets = tuningData["sets"];
++	if (!sets.isList()) {
++		LOG(IPASoftLsc, Error) << "'sets' not found in tuning file";
++		return -EINVAL;
++	}
++
++	sets_.clear();
++
++	for (const auto &set : sets.asList()) {
++		unsigned int ct = set["ct"].get<uint32_t>(0);
++		Components comp;
++
++		for (unsigned int c = 0; c < 3; c++) {
++			auto values = set[kChannels[c]].get<std::vector<float>>();
++			if (!values || values->size() != kGridSize * kGridSize) {
++				LOG(IPASoftLsc, Error)
++					<< "Set for " << ct << " K: '" << kChannels[c]
++					<< "' needs " << kGridSize * kGridSize
++					<< " values";
++				return -EINVAL;
++			}
++
++			for (float v : *values)
++				comp[c].push_back(std::clamp<long>(std::lround(v), 0, 255));
++		}
++
++		if (!sets_.try_emplace(ct, std::move(comp)).second) {
++			LOG(IPASoftLsc, Error)
++				<< "Multiple sets for " << ct << " K";
++			return -EINVAL;
++		}
++	}
++
++	if (sets_.empty()) {
++		LOG(IPASoftLsc, Error) << "No Lsc sets found";
++		return -EINVAL;
++	}
++
++	context.ctrlMap[&controls::LensShadingCorrectionEnable] =
++		ControlInfo(false, true, true);
++	context.lscEnabled = true;
++
++	return 0;
++}
++
++int Lsc::configure(IPAContext &context,
++		   [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	context.activeState.lsc.enabled = true;
++	lastAppliedCt_.reset();
++	identityApplied_ = false;
++
++	return 0;
++}
++
++void Lsc::queueRequest(IPAContext &context,
++		       [[maybe_unused]] const uint32_t frame,
++		       IPAFrameContext &frameContext,
++		       const ControlList &controls)
++{
++	const auto &enable = controls.get(controls::LensShadingCorrectionEnable);
++	if (enable && *enable != context.activeState.lsc.enabled) {
++		context.activeState.lsc.enabled = *enable;
++		LOG(IPASoftLsc, Debug)
++			<< (*enable ? "Enabling" : "Disabling") << " Lsc";
++	}
++
++	frameContext.lsc.enabled = context.activeState.lsc.enabled;
++}
++
++void Lsc::interpolate(unsigned int ct, DebayerParams::LscLookupTable &lut) const
++{
++	auto upper = sets_.lower_bound(ct);
++	const Components *a, *b;
++	double lambda = 0.0;
++
++	if (upper == sets_.begin()) {
++		a = b = &upper->second;
++	} else if (upper == sets_.end()) {
++		a = b = &std::prev(upper)->second;
++	} else {
++		auto lower = std::prev(upper);
++		a = &lower->second;
++		b = &upper->second;
++		if (upper->first != ct)
++			lambda = static_cast<double>(ct - lower->first) /
++				 (upper->first - lower->first);
++		else
++			a = b;
++	}
++
++	for (unsigned int i = 0; i < kGridSize * kGridSize; i++) {
++		for (unsigned int c = 0; c < 3; c++) {
++			double v = (*a)[c][i] * (1.0 - lambda) + (*b)[c][i] * lambda;
++			lut[i * DebayerParams::kLscValuesPerCell + c] =
++				static_cast<uint8_t>(std::lround(v));
++		}
++		lut[i * DebayerParams::kLscValuesPerCell + 3] = 0; /* padding */
++	}
++}
++
++void Lsc::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		  IPAFrameContext &frameContext, DebayerParams *params)
++{
++	if (!frameContext.lsc.enabled) {
++		if (!identityApplied_) {
++			params->lscLut = DebayerParams::identityLscLut;
++			params->lscLutVersion++;
++			identityApplied_ = true;
++			lastAppliedCt_.reset();
++			LOG(IPASoftLsc, Debug) << "Lsc disabled";
++		}
++		return;
++	}
++
++	const unsigned int ct = context.activeState.awb.temperatureK;
++	if (lastAppliedCt_ &&
++	    utils::abs_diff(ct, *lastAppliedCt_) < kTemperatureThreshold)
++		return;
++
++	interpolate(ct, params->lscLut);
++	params->lscLutVersion++;
++	identityApplied_ = false;
++	lastAppliedCt_ = ct;
++
++	LOG(IPASoftLsc, Debug)
++		<< "Lsc table updated for " << ct << " K (version "
++		<< params->lscLutVersion << ")";
++}
++
++void Lsc::process([[maybe_unused]] IPAContext &context,
++		  [[maybe_unused]] const uint32_t frame,
++		  IPAFrameContext &frameContext,
++		  [[maybe_unused]] const SwIspStats *stats,
++		  ControlList &metadata)
++{
++	metadata.set(controls::LensShadingCorrectionEnable,
++		     frameContext.lsc.enabled);
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lsc.h b/src/ipa/simple/algorithms/lsc.h
+new file mode 100644
+index 0000000..b208653
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Lens shading correction
++ */
++
++#pragma once
++
++#include <array>
++#include <map>
++#include <optional>
++#include <stdint.h>
++#include <vector>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++	~Lsc() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context,
++		      const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++	void process(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     const SwIspStats *stats,
++		     ControlList &metadata) override;
++
++private:
++	/* One gain grid per colour channel, UQ<2, 6> values. */
++	using Components = std::array<std::vector<uint8_t>, 3>;
++
++	void interpolate(unsigned int ct, DebayerParams::LscLookupTable &lut) const;
++
++	std::map<unsigned int, Components> sets_;
++	std::optional<unsigned int> lastAppliedCt_;
++	bool identityApplied_ = true;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 1cd58d5..d9d5409 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -7,4 +7,5 @@ soft_simple_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lsc.cpp',
+ ])
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 036b7c7..c2cc3fa 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -75,6 +75,10 @@ struct IPAActiveState {
+ 		std::optional<float> contrast;
+ 		std::optional<float> saturation;
+ 	} knobs;
++
++	struct {
++		bool enabled = true;
++	} lsc;
+ };
+ 
+ struct IPAFrameContext : public FrameContext {
+@@ -90,6 +94,10 @@ struct IPAFrameContext : public FrameContext {
+ 	float gamma;
+ 	std::optional<float> contrast;
+ 	std::optional<float> saturation;
++
++	struct {
++		bool enabled = false;
++	} lsc;
+ };
+ 
+ struct IPAContext {
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index cce6307..f55ead3 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -178,6 +178,8 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 		params_->gamma = 1.0 / algorithms::kDefaultGamma;
+ 		params_->contrastExp = 1.0;
+ 		params_->gains = { { 1.0, 1.0, 1.0 } };
++		params_->lscLut = DebayerParams::identityLscLut;
++		params_->lscLutVersion = 0;
+ 		/* combinedMatrix is reset for each frame. */
+ 	}
+ 
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index 522c223..3c00150 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -71,6 +71,14 @@ namespace libcamera {
+  * \brief Lens shading lookup table
+  */
+ 
++/**
++ * \var DebayerParams::identityLscLut
++ * \brief Lens shading lookup table of identity mapping
++ *
++ * This table can be used to initialise the lens shading lookup table or to
++ * not apply any real lens shading correction.
++ */
++
+ /**
+  * \var DebayerParams::lscLutVersion
+  * \brief Incremented on each \a lscLut change
+diff --git a/test/ipa/meson.build b/test/ipa/meson.build
+index ceed15b..b226d97 100644
+--- a/test/ipa/meson.build
++++ b/test/ipa/meson.build
+@@ -7,11 +7,21 @@ ipa_test = [
+     {'name': 'ipa_interface_test', 'sources': ['ipa_interface_test.cpp']},
+ ]
+ 
++ipa_test += [
++    {
++        'name': 'soft_simple_lsc',
++        'sources': ['soft_simple_lsc.cpp',
++                    '../../src/ipa/simple/algorithms/lsc.cpp',
++                    '../../src/ipa/simple/ipa_context.cpp'],
++    },
++]
++
+ foreach test : ipa_test
+     exe = executable(test['name'], test['sources'],
+                      dependencies : [libcamera_private, libipa_dep],
+                      link_with : [test_libraries],
+-                     include_directories : [test_includes_internal])
++                     include_directories : [test_includes_internal,
++                                            '../../src/ipa/simple/'])
+ 
+     test(test['name'], exe, suite : 'ipa')
+ endforeach
+diff --git a/test/ipa/soft_simple_lsc.cpp b/test/ipa/soft_simple_lsc.cpp
+new file mode 100644
+index 0000000..a64d5c9
+--- /dev/null
++++ b/test/ipa/soft_simple_lsc.cpp
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Software ISP lens shading correction algorithm test
++ */
++
++#include <iostream>
++#include <memory>
++#include <stdlib.h>
++#include <string>
++#include <unistd.h>
++
++#include <libcamera/base/file.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "algorithms/lsc.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace ipa::soft;
++
++namespace {
++
++std::string gridLine(const char *name, int base)
++{
++	std::string s = std::string("      ") + name + ": [";
++	for (unsigned int i = 0; i < 17 * 17; i++)
++		s += (i ? ", " : "") + std::to_string(base + static_cast<int>(i % 5));
++	return s + "]\n";
++}
++
++} /* namespace */
++
++class SoftSimpleLscTest : public Test
++{
++protected:
++	int init() override
++	{
++		/* Two sets: 64 = 1.0 everywhere (+ a ripple), and 128 = 2.0. */
++		std::string yaml = "Lsc:\n  sets:\n    - ct: 3000\n";
++		yaml += gridLine("r", 60) + gridLine("g", 60) + gridLine("b", 60);
++		yaml += "    - ct: 6000\n";
++		yaml += gridLine("r", 120) + gridLine("g", 120) + gridLine("b", 120);
++
++		file_ = "/tmp/libcamera.test.XXXXXX";
++		int fd = mkstemp(&file_.front());
++		if (fd == -1)
++			return TestFail;
++		ssize_t ret = write(fd, yaml.data(), yaml.size());
++		close(fd);
++
++		return ret == static_cast<ssize_t>(yaml.size()) ? TestPass : TestFail;
++	}
++
++	void cleanup() override
++	{
++		unlink(file_.c_str());
++	}
++
++	bool prepare(algorithms::Lsc &lsc, IPAContext &context, unsigned int ct,
++		     DebayerParams &params, const ControlList &controls)
++	{
++		context.activeState.awb.temperatureK = ct;
++		IPAFrameContext &fc = context.frameContexts.alloc(frame_);
++		lsc.queueRequest(context, frame_, fc, controls);
++		lsc.prepare(context, frame_, fc, &params);
++		frame_++;
++		return true;
++	}
++
++	int run() override
++	{
++		File file(file_);
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return TestFail;
++		std::unique_ptr<ValueNode> root = YamlParser::parse(file);
++		if (!root)
++			return TestFail;
++
++		IPAContext context(8);
++		algorithms::Lsc lsc;
++		if (lsc.init(context, (*root)["Lsc"]) || !context.lscEnabled) {
++			std::cerr << "init() failed" << std::endl;
++			return TestFail;
++		}
++		IPAConfigInfo info;
++		lsc.configure(context, info);
++
++		DebayerParams params;
++		ControlList none(controls::controls);
++
++		/* The default table is the identity: 64 = 1.0. */
++		if (params.lscLut[0] != 64 || params.lscLut[4] != 64) {
++			std::cerr << "default LUT is not the identity" << std::endl;
++			return TestFail;
++		}
++
++		/* Below the first set: that set, unchanged (ripple i % 5). */
++		prepare(lsc, context, 2000, params, none);
++		if (params.lscLut[0] != 60 || params.lscLut[4 * 1] != 61 ||
++		    params.lscLut[1] != 60 || params.lscLut[3] != 0 ||
++		    params.lscLutVersion != 1) {
++			std::cerr << "clamped low LUT wrong: " << int(params.lscLut[0])
++				  << " " << int(params.lscLut[4]) << " version "
++				  << params.lscLutVersion << std::endl;
++			return TestFail;
++		}
++
++		/* Halfway: (60 + 120) / 2 = 90 (+ ripple), 3 channels. */
++		prepare(lsc, context, 4500, params, none);
++		if (params.lscLut[0] != 90 || params.lscLut[4] != 91 ||
++		    params.lscLut[8] != 92 || params.lscLut[1] != 90 ||
++		    params.lscLut[2] != 90 || params.lscLut[3] != 0 ||
++		    params.lscLutVersion != 2) {
++			std::cerr << "interpolated LUT wrong: " << int(params.lscLut[0])
++				  << " " << int(params.lscLut[4]) << " version "
++				  << params.lscLutVersion << std::endl;
++			return TestFail;
++		}
++
++		/* A change below 100 K does not touch the table. */
++		prepare(lsc, context, 4550, params, none);
++		if (params.lscLutVersion != 2) {
++			std::cerr << "small change updated the LUT" << std::endl;
++			return TestFail;
++		}
++
++		/* Above the last set. */
++		prepare(lsc, context, 9000, params, none);
++		if (params.lscLut[0] != 120 || params.lscLutVersion != 3) {
++			std::cerr << "clamped high LUT wrong" << std::endl;
++			return TestFail;
++		}
++
++		/* Disabled by control: back to the identity. */
++		ControlList off(controls::controls);
++		off.set(controls::LensShadingCorrectionEnable, false);
++		prepare(lsc, context, 9000, params, off);
++		if (params.lscLut != DebayerParams::identityLscLut ||
++		    params.lscLutVersion != 4) {
++			std::cerr << "disabled LUT is not the identity" << std::endl;
++			return TestFail;
++		}
++
++		/* A tuning without sets is rejected. */
++		IPAContext context2(8);
++		algorithms::Lsc lsc2;
++		ValueNode empty;
++		if (lsc2.init(context2, empty) == 0) {
++			std::cerr << "empty tuning accepted" << std::endl;
++			return TestFail;
++		}
++
++		return TestPass;
++	}
++
++private:
++	std::string file_;
++	uint32_t frame_ = 0;
++};
++
++TEST_REGISTER(SoftSimpleLscTest)
+-- 
+2.56.1
+

@@ -1,0 +1,36 @@
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -78,10 +78,16 @@ uniform float contrastExp;
+  */
+ uniform float bin;
+ 
+-/* one raw pixel (its 8 high bits) at integer pixel coordinates p */
++/*
++ * one raw pixel (its 8 high bits) at integer pixel coordinates p, sampled at the centre of its texel. tex_step is
++ * 1/(texels - 1) (what the upstream path wants), so p * tex_step is off by up to half a texel towards the edges,
++ * and nearest sampling there picked the neighbouring byte or row: at exactly 2:1 (3840x2160 to 1080p) the picture
++ * became a checkerboard of red, green and blue blocks. A texel's centre is (i + 0.5) / texels.
++ */
+ float rawpx(vec2 p)
+ {
+-	return texture2D(tex_y, vec2(floor(BPP * p.x + 0.02) * tex_step.x, p.y * tex_step.y)).r;
++	vec2 texels = vec2(1.0) / tex_step + vec2(1.0);
++	return texture2D(tex_y, (vec2(floor(BPP * p.x + 0.02), p.y) + vec2(0.5)) / texels).r;
+ }
+ 
+ /* the Bayer quad whose top left pixel is q (even coordinates) as RGB */
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -466,7 +466,11 @@ void DebayerEGL::setShaderVariableValues
+ 	/* average the raw pixels under each output pixel when it covers 2x2 of them or more (see the shader) */
+ 	if (binUniform_ >= 0) {
+ 		static const char *force = utils::secure_getenv("LIBCAMERA_SOFTISP_BIN");	/* tuning aid: 0 or 1 */
+-		const bool bin = force ? force[0] == '1' : scale <= 0.5f;
++		/*
++		 * scale is against the native output, the input less its border: 3840x2160 to 1080p is 0.50026, which
++		 * missed binning, and the upstream path aliased against the Bayer phase in 240-pixel blocks
++		 */
++		const bool bin = force ? force[0] == '1' : scale <= 0.51f;
+ 		glUniform1f(binUniform_, bin ? 1.0f : 0.0f);
+ 	}
+ 
