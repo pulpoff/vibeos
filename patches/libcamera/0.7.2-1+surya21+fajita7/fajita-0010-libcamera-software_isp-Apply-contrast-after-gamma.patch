@@ -1,0 +1,102 @@
+From 783ef4b871a9d4dfa6eda75c23a82b8afa3552ce Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 10:53:56 +0100
+Subject: [PATCH 2/2] libcamera: software_isp: Apply contrast after gamma
+
+The S-curve pivots at 0.5, and in linear light, before gamma, 0.5 is a
+highlight: everything below it, most of a picture, got darker and
+flatter instead of gaining contrast. On the OnePlus 6T a contrast of 1.25
+darkened rooms without making them look less washed out.
+
+Apply the curve to the gamma-encoded value, where 0.5 is a mid tone, in
+both GPU shaders and in the CPU lookup table.
+---
+ src/libcamera/shaders/bayer_1x_packed.frag | 12 +++++++-----
+ src/libcamera/shaders/bayer_unpacked.frag  | 12 +++++++-----
+ src/libcamera/software_isp/debayer_cpu.cpp |  7 +++----
+ 3 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 48b0486..8006513 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -276,18 +276,20 @@ void main(void)
+ 	/* Colour Correction Matrix */
+ 	rgb = ccm * rgb;
+ 
++	/* Apply gamma after colour correction */
++	rgb = clamp(rgb, 0.0, 1.0);
++	rgb = pow(rgb, vec3(gamma));
++
+ 	/*
+-	 * Contrast
++	 * Contrast, around the middle of the gamma-encoded range: in linear
++	 * light 0.5 is a highlight, and the curve darkened most of the picture
++	 * instead of adding contrast to it.
+ 	 * contrastExp 0..2 contrast to 0..infinity; avoid actual infinity at tan(pi/2)
+ 	 */
+-	rgb = clamp(rgb, 0.0, 1.0);
+ 	rgb.r = apply_contrast(rgb.r);
+ 	rgb.g = apply_contrast(rgb.g);
+ 	rgb.b = apply_contrast(rgb.b);
+ 
+-	/* Apply gamma after colour correction */
+-	rgb = pow(rgb, vec3(gamma));
+-
+ #if defined (SWAP_BLUE)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e94..700a52d 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -141,17 +141,19 @@ void main(void) {
+     /* Colour Correction Matrix */
+     rgb = ccm * rgb;
+ 
++    /* Apply gamma after colour correction */
++    rgb = clamp(rgb, 0.0, 1.0);
++    rgb = pow(rgb, vec3(gamma));
++
+     /*
+-     * Contrast
++     * Contrast, around the middle of the gamma-encoded range: in linear
++     * light 0.5 is a highlight, and the curve darkened most of the picture
++     * instead of adding contrast to it.
+      */
+-    rgb = clamp(rgb, 0.0, 1.0);
+     rgb.r = apply_contrast(rgb.r);
+     rgb.g = apply_contrast(rgb.g);
+     rgb.b = apply_contrast(rgb.b);
+ 
+-    /* Apply gamma after colour correction */
+-    rgb = pow(rgb, vec3(gamma));
+-
+ #if defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4..6c8f675 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -984,14 +984,13 @@ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ 
+ 	const float divisor = gammaTable_.size() - 1.0;
+ 	for (auto [i, value] : utils::enumerate(gammaTable_)) {
+-		float normalized = i / divisor;
+-		/* Convert 0..2 to 0..infinity; avoid actual inifinity at tan(pi/2) */
+-		/* Apply simple S-curve */
++		float normalized = std::pow(i / divisor, gamma);
++		/* Apply simple S-curve, around the middle of the gamma-encoded range */
+ 		if (normalized < 0.5)
+ 			normalized = 0.5 * std::pow(normalized / 0.5, contrastExp);
+ 		else
+ 			normalized = 1.0 - 0.5 * std::pow((1.0 - normalized) / 0.5, contrastExp);
+-		value = UINT8_MAX * std::pow(normalized, gamma);
++		value = UINT8_MAX * normalized;
+ 	}
+ }
+ 
+-- 
+2.56.1
+

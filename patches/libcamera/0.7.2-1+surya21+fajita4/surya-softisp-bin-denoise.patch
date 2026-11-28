@@ -1,0 +1,94 @@
+Index: libcamera-0.7.2/src/libcamera/shaders/bayer_1x_packed.frag
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/shaders/bayer_1x_packed.frag
++++ libcamera-0.7.2/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -70,6 +70,29 @@ uniform mat3 ccm;
+ uniform vec3 blacklevel;
+ uniform float gamma;
+ uniform float contrastExp;
++/*
++ * 1.0 when the output is at least half the input's size or less: each output
++ * pixel then averages the 4x4 raw pixels under it (four Bayer quads) instead
++ * of demosaicing one raw pixel. The skipped pixels were all sensor noise
++ * thrown away; averaged, they take 2-3x of the noise out of the picture.
++ */
++uniform float bin;
++
++/* one raw pixel (its 8 high bits) at integer pixel coordinates p */
++float rawpx(vec2 p)
++{
++	return texture2D(tex_y, vec2(floor(BPP * p.x + 0.02) * tex_step.x, p.y * tex_step.y)).r;
++}
++
++/* the Bayer quad whose top left pixel is q (even coordinates) as RGB */
++vec3 quad(vec2 q)
++{
++	vec2 o = tex_bayer_first_red;
++	vec2 n = vec2(1.0) - o;
++	return vec3(rawpx(q + o),
++		    (rawpx(q + vec2(o.x, n.y)) + rawpx(q + vec2(n.x, o.y))) * 0.5,
++		    rawpx(q + n));
++}
+ 
+ float apply_contrast(float value)
+ {
+@@ -108,6 +131,14 @@ void main(void)
+ 	 * by hand.
+ 	 */
+ 	center_pixel = floor(textureOut * tex_size);
++
++	if (bin > 0.5) {
++		/* the quad the pixel is in and its neighbours on the pixel's side, centred on it */
++		vec2 q = floor(center_pixel * 0.5) * 2.0;
++		vec2 d = vec2(mod(center_pixel.x, 2.0) < 1.0 ? -2.0 : 2.0,
++			      mod(center_pixel.y, 2.0) < 1.0 ? -2.0 : 2.0);
++		rgb = (quad(q) + quad(q + vec2(d.x, 0.0)) + quad(q + vec2(0.0, d.y)) + quad(q + d)) * 0.25;
++	} else {
+ 	center_bytes.y = center_pixel.y;
+ 
+ 	/*
+@@ -225,6 +256,7 @@ void main(void)
+ 		(even_row ?
+ 			vec3(patterns.y, C, patterns.x) :
+ 			vec3(patterns.wz, C));
++	}
+ 
+ 	/*
+ 	 * \todo: Black level normalising, AWB and digital gain could be
+Index: libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/debayer_egl.cpp
++++ libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.cpp
+@@ -121,6 +121,7 @@ int DebayerEGL::getShaderVariableLocatio
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	binUniform_ = glGetUniformLocation(programId_, "bin");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -462,6 +463,12 @@ void DebayerEGL::setShaderVariableValues
+ 	glUniform2fv(textureUniformStep_, 1, Step);
+ 	glUniform1f(textureUniformStrideFactor_, Stride);
+ 	glUniformMatrix4fv(textureUniformProjMatrix_, 1, GL_FALSE, projMatrix);
++	/* average the raw pixels under each output pixel when it covers 2x2 of them or more (see the shader) */
++	if (binUniform_ >= 0) {
++		static const char *force = utils::secure_getenv("LIBCAMERA_SOFTISP_BIN");	/* tuning aid: 0 or 1 */
++		const bool bin = force ? force[0] == '1' : scale <= 0.5f;
++		glUniform1f(binUniform_, bin ? 1.0f : 0.0f);
++	}
+ 
+ 	LOG(Debayer, Debug) << "vertexIn " << attributeVertex_ << " textureIn " << attributeTexture_
+ 			    << " tex_y " << textureUniformBayerDataIn_
+Index: libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.h
+===================================================================
+--- libcamera-0.7.2.orig/src/libcamera/software_isp/debayer_egl.h
++++ libcamera-0.7.2/src/libcamera/software_isp/debayer_egl.h
+@@ -90,6 +90,7 @@ private:
+ 	GLint attributeTexture_;
+ 	GLint textureUniformStep_;
+ 	GLint textureUniformSize_;
++	GLint binUniform_ = -1;
+ 	GLint textureUniformStrideFactor_;
+ 	GLint textureUniformBayerFirstRed_;
+ 	GLint textureUniformProjMatrix_;

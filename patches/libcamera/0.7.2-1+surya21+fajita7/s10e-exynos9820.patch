@@ -1,0 +1,138 @@
+Description: Samsung Galaxy S10e (Exynos 9820): CSIS in the simple pipeline, sensor helpers for s5k2l4/s5k3p9/s5k3j1,
+ and sharpness10() (the AF focus measure for unpacked 16-bit raw from the CSIS write DMA)
+Author: pulpoff <pashkovsky@gmail.com>
+---
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -125,6 +125,9 @@
+ 	/* focus measure on 10-bit packed (CSI2P) Bayer input, see sharpness10P() */
+ 	void sharpness10P(const uint8_t *frame, SwIspStats &stats);
+ 	bool sharpness10P_ = false;
++	/* and on 10-bit unpacked (16 bits a pixel) Bayer input, see sharpness10() */
++	void sharpness10(const uint8_t *frame, SwIspStats &stats);
++	bool sharpness10_ = false;
+ 
+ 	/* white balance gains (8.8 fixed point, green 256) and black level (0..1) the ISP is using now */
+ 	unsigned int neutralGainR_ = 0, neutralGainB_ = 0;
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -605,6 +605,31 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx327", CameraSensorHelperImx327)
+ 
++/*
++ * The Samsung Galaxy S10e (beyond0lte) cameras: the analogue gain register
++ * takes 32 * gain (0x20 = 1x .. 0x200 = 16x), black level 64 at 10 bits.
++ */
++class CameraSensorHelperS5kBeyond : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5kBeyond()
++	{
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k2l4", CameraSensorHelperS5kBeyond)
++
++class CameraSensorHelperS5k3p9 : public CameraSensorHelperS5kBeyond
++{
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3p9", CameraSensorHelperS5k3p9)
++
++class CameraSensorHelperS5k3j1 : public CameraSensorHelperS5kBeyond
++{
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3j1", CameraSensorHelperS5k3j1)
++
+ class CameraSensorHelperImx335 : public CameraSensorHelper
+ {
+ public:
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -258,6 +258,7 @@
+ 
+ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "dcmipp", {}, false },
++	{ "exynos9820-csis", {}, true },
+ 	{ "imx7-csi", { { "pxp", 1 } }, true },
+ 	{ "intel-ipu6", {}, true },
+ 	{ "intel-ipu7", {}, true },
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -527,6 +527,7 @@
+ {
+ 	stride_ = inputCfg.stride;
+ 	stats_.resize(statsBufferCount);
++	sharpness10P_ = sharpness10_ = false;
+ 
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
+@@ -542,6 +543,7 @@
+ 		case 10:
+ 			stats0_ = &SwStatsCpu::statsBGGR10Line0;
+ 			sumShift_ = 2;
++			sharpness10_ = true;
+ 			return 0;
+ 		case 12:
+ 			stats0_ = &SwStatsCpu::statsBGGR12Line0;
+@@ -669,6 +671,50 @@
+ 
+ 	if (sharpness10P_)
+ 		sharpness10P(in.planes()[0].data(), stats_[0]);
++	else if (sharpness10_)
++		sharpness10(in.planes()[0].data(), stats_[0]);
++}
++
++/*
++ * sharpness10P() on 10-bit unpacked Bayer (2 bytes a pixel, little endian, as the Exynos 9820 CSIS write DMA
++ * stores it): the same 4x4 blocks of the top 8 bits, so the focus measure and its tuning carry over.
++ */
++void SwStatsCpu::sharpness10(const uint8_t *frame, SwIspStats &stats)
++{
++	const unsigned int w = window_.width, h = window_.height;
++	const unsigned int x0 = (window_.x + w / 3) & ~3u, x1 = (window_.x + 2 * w / 3) & ~3u;
++	const unsigned int y0 = (window_.y + h / 3) & ~1u, y1 = window_.y + 2 * h / 3;
++	uint64_t sum = 0, level = 0;
++	uint32_t count = 0;
++
++	static const std::array<uint16_t, 16 * 255 + 1> kRoot = [] {
++		std::array<uint16_t, 16 * 255 + 1> t{};
++		for (unsigned int i = 0; i < t.size(); i++)
++			t[i] = static_cast<uint16_t>(std::lround(16.0 * std::sqrt(static_cast<double>(i))));
++		return t;
++	}();
++	auto block = [&](const uint8_t *p) {
++		int t = 0;
++		for (unsigned int r = 0; r < 4; r++, p += stride_) {
++			const uint16_t *q = reinterpret_cast<const uint16_t *>(p);
++			t += (q[0] >> 2) + (q[1] >> 2) + (q[2] >> 2) + (q[3] >> 2);
++		}
++		return static_cast<int>(kRoot[std::min(t, 16 * 255)]);
++	};
++	for (unsigned int y = y0; y + 8 <= y1; y += 8) {
++		const uint8_t *row = frame + y * stride_;
++		const uint8_t *below = row + 4 * stride_;
++		for (unsigned int x = x0; x + 8 <= x1; x += 4) {
++			const int c = block(row + 2 * x);
++			const int dh = c - block(row + 2 * (x + 4)), dv = c - block(below + 2 * x);
++			sum += dh * dh + dv * dv;
++			level += c;
++			count += 6;
++		}
++	}
++	stats.sharpness += sum;
++	stats.sharpnessCount += count;
++	stats.sharpnessLevel += level;
+ }
+ 
+ /*
+@@ -735,6 +781,8 @@
+ 		/* autofocus wants its measure on every frame: a lens step then takes 3 frames instead of 4-8 */
+ 		if (sharpness10P_)
+ 			sharpness10P(input.planes()[0].data(), stats_[0]);
++		else if (sharpness10_)
++			sharpness10(input.planes()[0].data(), stats_[0]);
+ 		finishFrame(frame, bufferId);
+ 		return;
+ 	}
