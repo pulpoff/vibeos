@@ -12,7 +12,9 @@ set -u
 DEV=${QMI_DEVICE:-qrtr://0}
 CONF=${VOLTE_CONF:-/etc/qcom-volte-provision.conf}
 NMDIR=${NM_CONNECTIONS:-/etc/NetworkManager/system-connections}
-q() { timeout "${QMI_TIMEOUT:-10}" qmicli -d "$DEV" "$@" 2>/dev/null; }
+# qmicli takes the first SIGTERM as "cancel the request" and then waits for the modem to answer; while the modem
+# restarts its configuration nobody does, and without the KILL a call hangs until systemd gives up on the unit
+q() { timeout -k 2 "${QMI_TIMEOUT:-10}" qmicli -d "$DEV" "$@" 2>/dev/null; }
 conf() { [ -r "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
 now() { date +%s; }
 

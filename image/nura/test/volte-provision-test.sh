@@ -5,7 +5,7 @@
 # to IPv6, its default profile to the APN of NetworkManager's mobile connection, and the modem goes online once
 # so the new config has taken effect before ModemManager sets up the data path; nothing is changed when all
 # is already so, for another network, when the modem lacks the config, or while 81voltd is masked or missing; the
-# config file wins over the table.
+# config file wins over the table; a qmicli that does not end on SIGTERM is killed.
 # Needs only sh and awk; touches only a temporary directory.
 set -u
 S=${1:-$(cd "$(dirname "$0")/.." && pwd)/files/qcom-volte-provision}
@@ -27,6 +27,8 @@ case "$3" in
 	printf "[qrtr://0] Successfully got home network:\n\tHome network:\n\t\tMCC: '%s'\n\t\tMNC: '%s'\n\tNetwork name source: mcc-mnc\n" \
 		"${HOME_NET%-*}" "${HOME_NET#*-}" ;;
 --pdc-list-configs=software)
+	# the modem restarting its configuration: no answer, and like qmicli the first SIGTERM does not end it
+	[ -n "${HANG:-}" ] && [ -s "$CALLS" ] && { trap '' TERM; exec sleep 60; }
 	active=$(cat "$ACTIVE")
 	echo "Total configurations: $(wc -l < "$MBNS" | tr -d ' ')"
 	n=0
@@ -144,6 +146,14 @@ NO_ACTIVATE=1; export NO_ACTIVATE
 run "config never reported active: profiles left alone" 262231234567890 "" $OV "$FRESH" "" \
 	"MBN Netherlands-VoLTE-Vodafone not reported active, profiles left alone" "--pdc-activate-config=software,$NL"
 unset NO_ACTIVATE
+HANG=1 QMI_TIMEOUT=1; export HANG QMI_TIMEOUT
+t0=$(date +%s)
+run "modem silent after the activation, qmicli ignoring SIGTERM: given up on" 262231234567890 "" $OV "$FRESH" "" \
+	"MBN Netherlands-VoLTE-Vodafone not reported active, profiles left alone" "--pdc-activate-config=software,$NL"
+t=$(($(date +%s) - t0))
+if [ $t -le 10 ]; then echo "  ok: a hanging qmicli is killed (${t}s)"
+else echo "  FAIL: a hanging qmicli held the script ${t}s"; FAILS=$((FAILS + 1)); fi
+unset HANG QMI_TIMEOUT
 VOLTD=masked
 run "81voltd masked: nothing changed" 262231234567890 "" $OV "$FRESH" "" \
 	"81voltd masked or not installed, nothing changed" ""
