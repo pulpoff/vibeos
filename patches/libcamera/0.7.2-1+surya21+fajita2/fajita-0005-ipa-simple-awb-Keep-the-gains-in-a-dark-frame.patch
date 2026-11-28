@@ -1,0 +1,59 @@
+From 19171f4a17632b74f45e3f97c0f7dbfac9e49ab8 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 07:16:10 +0100
+Subject: [PATCH] ipa: simple: awb: Keep the gains in a dark frame
+
+Within a level of the black level green above black rounds to the floor
+while red or blue keep some noise, and their ratio set a blue gain of
+0.0001 on the OnePlus 6T. Keep the gains when green averages less than
+one level above black, and clamp both gains to 1/4 .. 4.
+---
+ src/ipa/simple/algorithms/awb.cpp | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index 90d3a99..fc9904b 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -94,13 +95,27 @@ void Awb::process(IPAContext &context,
+ 	const RGB<uint64_t> sum = neutral ? stats->sumNeutral_.max(offsetN + minValid) - offsetN
+ 					  : stats->sum_.max(offset + minValid) - offset;
+ 
++	/*
++	 * OnePlus 6T in a dim room: the first frames, and a dark scene at the
++	 * longest exposure, sit within a level of the black level. Green above
++	 * black then rounds to the minValid floor while red or blue keep a few
++	 * levels of noise, and the ratio set a blue gain of 0.0001 and a colour
++	 * temperature of 1700 K that took seconds to recover from. Below a mean
++	 * of one level above black there is no colour to measure: keep the gains.
++	 */
++	const uint64_t count = neutral ? stats->neutralCount : nPixels;
++	if (sum.g() < count) {
++		LOG(IPASoftAwb, Debug) << "too dark for white balance, gains kept";
++		return;
++	}
++
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+-	 * Clamp max gain at 4.0, this also avoids 0 division.
++	 * Clamp the gains to 1/4 .. 4, this also avoids 0 division.
+ 	 */
+ 	auto &gains = context.activeState.awb.gains;
+-	const float greyR = sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r();
+-	const float greyB = sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b();
++	const float greyR = std::clamp(static_cast<float>(sum.g()) / sum.r(), 0.25f, 4.0f);
++	const float greyB = std::clamp(static_cast<float>(sum.g()) / sum.b(), 0.25f, 4.0f);
+ 
+ 	/*
+ 	 * Debian/Mobian on the POCO X3 NFC: the full grey-world correction
+-- 
+2.56.1
+
