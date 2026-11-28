@@ -1,0 +1,897 @@
+From 56890ecab6d20e4d50fa9928fb30a6bff8a92c51 Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 14:48:04 +0100
+Subject: [PATCH] libcamera: software_isp: Correct static phase detection
+ pixels
+
+The Sony IMX376 delivers its phase-detection pixels uncorrected. In
+every 16x16 tile eight blue sites, (1,1) (9,1) (5,5) (13,5) (5,9)
+(13,9) (1,13) (9,13), read 1.4-1.8x their same-colour neighbours; all
+other sites are within 0.2%. The sensor cannot be told to correct them.
+
+SwStatsCpu samples one 2x2 block out of every four columns, so half of
+its blue samples are such pixels. AWB then computes a blue gain of ~1.3
+instead of ~1.9 and the image turns yellow-green. The debayered image
+also shows a faint grid of blue dots.
+
+Describe the pixels in CameraSensorProperties, valid only for the
+output size they were measured on, and add PdafPixelCorrector, which
+replaces each site by the rounded mean of its in-frame same-colour
+neighbours at +-2. It supports 10-bit CSI-2 packed, 8-bit and 16-bit
+container raw, and is precomputed at configure time.
+
+The correction runs in Debayer::process() on the ISP worker thread, on
+the input mapped read/write and DMA-synced ReadWrite, before the
+statistics and debayering, for both the CPU and EGL back ends. For EGL
+the sync ends right after the correction, flushing the CPU writes
+before the dmabuf is imported by the GPU.
+
+Assisted-by: AI coding agent
+---
+ .../internal/camera_sensor_properties.h       |   8 +
+ .../internal/software_isp/meson.build         |   1 +
+ .../internal/software_isp/pdaf_pixels.h       |  54 ++++
+ .../internal/software_isp/software_isp.h      |   2 +
+ .../sensor/camera_sensor_properties.cpp       |  47 ++++
+ src/libcamera/software_isp/debayer.cpp        |  28 +-
+ src/libcamera/software_isp/debayer.h          |   7 +
+ src/libcamera/software_isp/debayer_cpu.cpp    |   6 +-
+ src/libcamera/software_isp/debayer_egl.cpp    |  37 ++-
+ src/libcamera/software_isp/meson.build        |   1 +
+ src/libcamera/software_isp/pdaf_pixels.cpp    | 266 ++++++++++++++++++
+ src/libcamera/software_isp/software_isp.cpp   |   7 +
+ test/meson.build                              |   1 +
+ test/pdaf-pixels.cpp                          | 154 ++++++++++
+ 14 files changed, 608 insertions(+), 11 deletions(-)
+ create mode 100644 include/libcamera/internal/software_isp/pdaf_pixels.h
+ create mode 100644 src/libcamera/software_isp/pdaf_pixels.cpp
+ create mode 100644 test/pdaf-pixels.cpp
+
+diff --git a/include/libcamera/internal/camera_sensor_properties.h b/include/libcamera/internal/camera_sensor_properties.h
+index d7d4dab..071568f 100644
+--- a/include/libcamera/internal/camera_sensor_properties.h
++++ b/include/libcamera/internal/camera_sensor_properties.h
+@@ -10,6 +10,7 @@
+ #include <map>
+ #include <stdint.h>
+ #include <string>
++#include <vector>
+ 
+ #include <libcamera/control_ids.h>
+ #include <libcamera/geometry.h>
+@@ -24,11 +25,18 @@ struct CameraSensorProperties {
+ 		uint8_t hblankDelay;
+ 	};
+ 
++	struct PhaseDetectionPixels {
++		Size outputSize;
++		Size period;
++		std::vector<Point> sites;
++	};
++
+ 	static const CameraSensorProperties *get(const std::string &sensor);
+ 
+ 	Size unitCellSize;
+ 	std::map<controls::draft::TestPatternModeEnum, int32_t> testPatternModes;
+ 	SensorDelays sensorDelays;
++	PhaseDetectionPixels phaseDetectionPixels = {};
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/meson.build b/include/libcamera/internal/software_isp/meson.build
+index df7c3b9..b1af198 100644
+--- a/include/libcamera/internal/software_isp/meson.build
++++ b/include/libcamera/internal/software_isp/meson.build
+@@ -3,6 +3,7 @@
+ libcamera_internal_headers += files([
+     'benchmark.h',
+     'debayer_params.h',
++    'pdaf_pixels.h',
+     'software_isp.h',
+     'swisp_stats.h',
+     'swstats_cpu.h',
+diff --git a/include/libcamera/internal/software_isp/pdaf_pixels.h b/include/libcamera/internal/software_isp/pdaf_pixels.h
+new file mode 100644
+index 0000000..282c2ef
+--- /dev/null
++++ b/include/libcamera/internal/software_isp/pdaf_pixels.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Pascal Garber
++ *
++ * Correction of static phase-detection pixels in raw frames
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <vector>
++
++#include <libcamera/base/span.h>
++
++#include <libcamera/geometry.h>
++
++#include "libcamera/internal/bayer_format.h"
++#include "libcamera/internal/camera_sensor_properties.h"
++
++namespace libcamera {
++
++class PdafPixelCorrector
++{
++public:
++	int configure(const CameraSensorProperties::PhaseDetectionPixels &pattern,
++		      const Size &size, unsigned int stride,
++		      const BayerFormat &format);
++	void disable();
++
++	bool isEnabled() const { return format_ != Format::None; }
++
++	bool correct(Span<uint8_t> data) const;
++
++private:
++	enum class Format {
++		None,
++		Raw8,
++		Raw16,
++		Csi2Packed10,
++	};
++
++	template<typename Pixel>
++	void correctFrame(uint8_t *data) const;
++
++	Format format_ = Format::None;
++	Size size_;
++	unsigned int stride_ = 0;
++	size_t minDataSize_ = 0;
++	unsigned int periodWidth_ = 0;
++	/* The x coordinates of the sites in a tile, for each row of the tile */
++	std::vector<std::vector<unsigned int>> rowSites_;
++};
++
++} /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 289467c..aa92b08 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -36,6 +36,7 @@
+ 
+ namespace libcamera {
+ 
++struct CameraSensorProperties;
+ class Debayer;
+ class FrameBuffer;
+ class PixelFormat;
+@@ -96,6 +97,7 @@ private:
+ 	void inputReady(FrameBuffer *input);
+ 	void outputReady(FrameBuffer *output);
+ 	std::unique_ptr<Debayer> debayer_;
++	const CameraSensorProperties *sensorProps_ = nullptr;
+ 	Thread ispWorkerThread_;
+ 	SharedMemObject<DebayerParams> sharedParams_;
+ 	DebayerParams debayerParams_;
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index ce86246..fd96ba1 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -47,6 +47,41 @@ LOG_DEFINE_CATEGORY(CameraSensorProperties)
+  *
+  * This structure may be defined as empty if the actual sensor delays are not
+  * available or have not been measured.
++ *
++ * \var CameraSensorProperties::phaseDetectionPixels
++ * \brief Static phase-detection pixels the sensor outputs uncorrected
++ *
++ * Some sensors embed phase-detection (PDAF) pixels in the Bayer array and
++ * deliver their raw values without correcting them, so that they read far
++ * brighter or darker than their same-colour neighbours. This structure
++ * describes where they are, to let the raw data be repaired. It may be left
++ * empty if the sensor has no such pixels or they are corrected by the sensor.
++ */
++
++/**
++ * \struct CameraSensorProperties::PhaseDetectionPixels
++ * \brief Location of the uncorrected phase-detection pixels
++ *
++ * The pixels repeat in a regular pattern. The coordinates are in pixels,
++ * relative to the origin (top-left corner) of the sensor output in the mode
++ * the pattern was measured in. As the position of the pattern in the output
++ * depends on the mode's crop and binning, the description only applies to
++ * raw frames of exactly outputSize; users must ignore it for any other size.
++ *
++ * No site is a same-colour neighbour (at a distance of two pixels along x or
++ * y) of another site, so each can be repaired from its neighbours.
++ *
++ * \var CameraSensorProperties::PhaseDetectionPixels::outputSize
++ * \brief The size of the sensor output the pattern applies to
++ *
++ * \var CameraSensorProperties::PhaseDetectionPixels::period
++ * \brief The size of the tile after which the pattern repeats, counted from
++ * the origin of the output
++ *
++ * \var CameraSensorProperties::PhaseDetectionPixels::sites
++ * \brief The coordinates of the phase-detection pixels in the first tile
++ *
++ * The list is empty if the sensor has no phase-detection pixels to correct.
+  */
+ 
+ /**
+@@ -282,6 +317,18 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				{ controls::draft::TestPatternModePn9, 4 },
+ 			},
+ 			.sensorDelays = { },
++			/*
++			 * Measured on the only mode: eight blue sites per
++			 * 16x16 tile read 1.4-1.8x their neighbours.
++			 */
++			.phaseDetectionPixels = {
++				.outputSize = { 2592, 1940 },
++				.period = { 16, 16 },
++				.sites = {
++					{ 1, 1 }, { 9, 1 }, { 5, 5 }, { 13, 5 },
++					{ 5, 9 }, { 13, 9 }, { 1, 13 }, { 9, 13 },
++				},
++			},
+ 		} },
+ 		{ "imx415", {
+ 			.unitCellSize = { 1450, 1450 },
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index 3c00150..c8f3872 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -317,14 +317,40 @@ Debayer::~Debayer()
+  * DebayerEGL::start.
+  */
+ 
++/**
++ * \brief Enable the correction of phase-detection pixels in the input frames
++ * \param[in] pattern The phase-detection pixels of the sensor
++ * \param[in] inputCfg The input configuration, as passed to configure()
++ *
++ * Call after configure() and while the debayer is stopped. The correction is
++ * enabled only if \a pattern applies to the input size and format, and runs
++ * in process() on the input frame before anything reads it, so that the
++ * statistics and the debayering both see the corrected data. If the pattern
++ * does not apply, the correction is disabled.
++ */
++void Debayer::configurePdaf(const CameraSensorProperties::PhaseDetectionPixels &pattern,
++			    const StreamConfiguration &inputCfg)
++{
++	int ret = pdaf_.configure(pattern, inputCfg.size, inputCfg.stride,
++				  BayerFormat::fromPixelFormat(inputCfg.pixelFormat));
++	if (!ret)
++		LOG(Debayer, Info)
++			<< "Correcting " << pattern.sites.size()
++			<< " phase-detection pixels per " << pattern.period << " tile";
++}
++
+ /**
+  * \fn void Debayer::dmaSyncBegin(DebayerParams &params)
+  * \brief Common CPU/GPU Dma Sync Buffer begin
+  */
+ void Debayer::dmaSyncBegin(std::vector<DmaSyncer> &dmaSyncers, FrameBuffer *input, FrameBuffer *output)
+ {
++	/* The phase-detection pixel correction writes to the input */
++	DmaSyncer::SyncType inputSync = pdaf_.isEnabled() ? DmaSyncer::SyncType::ReadWrite
++							   : DmaSyncer::SyncType::Read;
++
+ 	for (const FrameBuffer::Plane &plane : input->planes())
+-		dmaSyncers.emplace_back(plane.fd, DmaSyncer::SyncType::Read);
++		dmaSyncers.emplace_back(plane.fd, inputSync);
+ 
+ 	if (output) {
+ 		for (const FrameBuffer::Plane &plane : output->planes())
+diff --git a/src/libcamera/software_isp/debayer.h b/src/libcamera/software_isp/debayer.h
+index d6dc24d..a6adc1c 100644
+--- a/src/libcamera/software_isp/debayer.h
++++ b/src/libcamera/software_isp/debayer.h
+@@ -21,9 +21,11 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
++#include "libcamera/internal/camera_sensor_properties.h"
+ #include "libcamera/internal/dma_buf_allocator.h"
+ #include "libcamera/internal/software_isp/benchmark.h"
+ #include "libcamera/internal/software_isp/debayer_params.h"
++#include "libcamera/internal/software_isp/pdaf_pixels.h"
+ 
+ namespace libcamera {
+ 
+@@ -43,6 +45,9 @@ public:
+ 			      bool ccmEnabled,
+ 			      bool lscEnabled) = 0;
+ 
++	void configurePdaf(const CameraSensorProperties::PhaseDetectionPixels &pattern,
++			   const StreamConfiguration &inputCfg);
++
+ 	virtual std::vector<PixelFormat> formats(PixelFormat inputFormat) = 0;
+ 
+ 	virtual std::tuple<unsigned int, unsigned int>
+@@ -89,6 +94,8 @@ private:
+ protected:
+ 	void dmaSyncBegin(std::vector<DmaSyncer> &dmaSyncers, FrameBuffer *input, FrameBuffer *output);
+ 	static bool isStandardBayerOrder(BayerFormat::Order order);
++
++	PdafPixelCorrector pdaf_;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 9cab6b7..d8c4299 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -1081,7 +1081,8 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	metadata.sequence = input->metadata().sequence;
+ 	metadata.timestamp = input->metadata().timestamp;
+ 
+-	MappedFrameBuffer in(input, MappedFrameBuffer::MapFlag::Read);
++	MappedFrameBuffer in(input, pdaf_.isEnabled() ? MappedFrameBuffer::MapFlag::ReadWrite
++						      : MappedFrameBuffer::MapFlag::Read);
+ 	MappedFrameBuffer out(output, MappedFrameBuffer::MapFlag::Write);
+ 	if (!in.isValid() || !out.isValid()) {
+ 		LOG(Debayer, Error) << "mmap-ing buffer(s) failed";
+@@ -1089,6 +1090,9 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 		return;
+ 	}
+ 
++	/* Before the statistics and the debayering threads read the frame */
++	pdaf_.correct(in.planes()[0]);
++
+ 	stats_->startFrame(frame);
+ 
+ 	workPendingMutex_.lock();
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index d46bdeb..d0eeb13 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -574,7 +574,8 @@ eGLImage *DebayerEGL::getCachedInputFrameBuffer(FrameBuffer *input, std::optiona
+ 
+ 	/* DMA mode fail create/update an existing texture using the slow path */
+ 	inDmaSyncer->emplace(input->planes()[0].fd, DmaSyncer::SyncType::Read);
+-	inMapped->emplace(input, MappedFrameBuffer::MapFlag::Read);
++	if (!*inMapped)
++		inMapped->emplace(input, MappedFrameBuffer::MapFlag::Read);
+ 	if (!inMapped->value().isValid()) {
+ 		LOG(Debayer, Error) << "mmap-ing buffer(s) failed";
+ 		if (cache_miss) {
+@@ -669,6 +670,24 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	std::optional<MappedFrameBuffer> inMapped;
+ 	std::optional<DmaSyncer> inDmaSyncer;
+ 
++	if (pdaf_.isEnabled()) {
++		inDmaSyncer.emplace(input->planes()[0].fd, DmaSyncer::SyncType::ReadWrite);
++		inMapped.emplace(input, MappedFrameBuffer::MapFlag::ReadWrite);
++		if (inMapped->isValid())
++			pdaf_.correct(inMapped->planes()[0]);
++		else {
++			LOG(Debayer, Error) << "mmap-ing buffer(s) failed";
++			inMapped.reset();
++		}
++
++		/*
++		 * End the CPU access now: the sync flushes the CPU writes,
++		 * which the GPU reads from the imported dmabuf. The mapping
++		 * stays for the slow path and the statistics, which sync again.
++		 */
++		inDmaSyncer.reset();
++	}
++
+ 	stats_->setNeutralParams(params.gains, params.blackLevel.g());
+ 
+ 	if (debayerGPU(input, output, params, &inMapped, &inDmaSyncer)) {
+@@ -685,16 +704,16 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	if (frame % SwStatsCpu::kStatPerNumFrames && !params.focusEveryFrame) {
+ 		stats_->finishFrame(frame, 0);
+ 	} else {
+-		if (!inMapped) {
+-			/*
+-			 * The buffer was directly imported into EGL and thus
+-			 * not mapped for texture upload. Do it now for the
+-			 * CPU-based stats calculation.
+-			 */
+-			assert(!inDmaSyncer);
++		/*
++		 * The buffer may have been directly imported into EGL and thus
++		 * not mapped for texture upload, or mapped for the phase
++		 * detection pixel correction with its sync already ended. Do
++		 * what is missing for the CPU-based stats calculation.
++		 */
++		if (!inDmaSyncer)
+ 			inDmaSyncer.emplace(input->planes()[0].fd, DmaSyncer::SyncType::Read);
++		if (!inMapped)
+ 			inMapped.emplace(input, MappedFrameBuffer::MapFlag::Read);
+-		}
+ 		stats_->processFrame(frame, 0, inMapped.value());
+ 	}
+ 	inDmaSyncer.reset();
+diff --git a/src/libcamera/software_isp/meson.build b/src/libcamera/software_isp/meson.build
+index 15f9e40..764c6cd 100644
+--- a/src/libcamera/software_isp/meson.build
++++ b/src/libcamera/software_isp/meson.build
+@@ -23,6 +23,7 @@ libcamera_internal_sources += files([
+     'benchmark.cpp',
+     'debayer.cpp',
+     'debayer_cpu.cpp',
++    'pdaf_pixels.cpp',
+     'software_isp.cpp',
+     'swstats_cpu.cpp',
+ ])
+diff --git a/src/libcamera/software_isp/pdaf_pixels.cpp b/src/libcamera/software_isp/pdaf_pixels.cpp
+new file mode 100644
+index 0000000..6015b74
+--- /dev/null
++++ b/src/libcamera/software_isp/pdaf_pixels.cpp
+@@ -0,0 +1,266 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Pascal Garber
++ *
++ * Correction of static phase-detection pixels in raw frames
++ */
++
++#include "libcamera/internal/software_isp/pdaf_pixels.h"
++
++#include <algorithm>
++#include <errno.h>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(PdafPixels)
++
++/**
++ * \file pdaf_pixels.h
++ * \brief Correction of static phase-detection pixels in raw frames
++ */
++
++/**
++ * \class PdafPixelCorrector
++ * \brief Replace uncorrected phase-detection pixels by their neighbours' mean
++ *
++ * Some sensors output their phase-detection pixels uncorrected, which breaks
++ * the statistics and leaves a dot pattern in the image. The corrector replaces
++ * the value of each such pixel, in place, with the rounded mean of its
++ * same-colour neighbours two pixels to the left, right, above and below,
++ * leaving out those outside the frame. As the colour of a site is not needed,
++ * the Bayer order does not matter.
++ *
++ * The neighbours are read as they are at that moment, so the sites must not be
++ * neighbours of each other, which CameraSensorProperties::PhaseDetectionPixels
++ * guarantees.
++ *
++ * The raw formats supported are 8 and 10 to 16 bits unpacked (in a 8-bit
++ * respectively little-endian 16-bit container) and 10 bits CSI-2 packed.
++ */
++
++namespace {
++
++/* 4 pixels in 5 bytes: bits 9..2 of pixel i in byte i, bits 1..0 in byte 4 */
++struct PixelCsi2Packed10 {
++	static unsigned int get(const uint8_t *row, unsigned int x)
++	{
++		const uint8_t *group = row + (x >> 2) * 5;
++		unsigned int i = x & 3;
++
++		return (group[i] << 2) | ((group[4] >> (2 * i)) & 3);
++	}
++
++	static void set(uint8_t *row, unsigned int x, unsigned int value)
++	{
++		uint8_t *group = row + (x >> 2) * 5;
++		unsigned int i = x & 3;
++
++		group[i] = value >> 2;
++		group[4] = (group[4] & ~(3 << (2 * i))) | ((value & 3) << (2 * i));
++	}
++};
++
++struct PixelRaw8 {
++	static unsigned int get(const uint8_t *row, unsigned int x)
++	{
++		return row[x];
++	}
++
++	static void set(uint8_t *row, unsigned int x, unsigned int value)
++	{
++		row[x] = value;
++	}
++};
++
++struct PixelRaw16 {
++	static unsigned int get(const uint8_t *row, unsigned int x)
++	{
++		return row[2 * x] | (row[2 * x + 1] << 8);
++	}
++
++	static void set(uint8_t *row, unsigned int x, unsigned int value)
++	{
++		row[2 * x] = value & 0xff;
++		row[2 * x + 1] = value >> 8;
++	}
++};
++
++} /* namespace */
++
++/**
++ * \brief Configure the correction for a raw frame format
++ * \param[in] pattern The phase-detection pixels of the sensor
++ * \param[in] size The size of the raw frames
++ * \param[in] stride The stride of the raw frames, in bytes
++ * \param[in] format The raw format of the frames
++ *
++ * The correction is enabled only if the pattern is not empty, \a size is equal
++ * to the output size the pattern was described for, and the format is
++ * supported. Otherwise it is disabled.
++ *
++ * Everything that depends on the pattern is computed here, so that correct()
++ * allocates nothing.
++ *
++ * \return 0 if the correction is enabled, -ENODEV if there is nothing to
++ * correct for these frames, -ENOTSUP if the format is not supported, -EINVAL
++ * if the stride is too small
++ */
++int PdafPixelCorrector::configure(const CameraSensorProperties::PhaseDetectionPixels &pattern,
++				  const Size &size, unsigned int stride,
++				  const BayerFormat &format)
++{
++	disable();
++
++	if (pattern.sites.empty() || pattern.period.isNull() ||
++	    size != pattern.outputSize)
++		return -ENODEV;
++
++	Format fmt = Format::None;
++	size_t rowBytes = 0;
++
++	if (format.packing == BayerFormat::Packing::CSI2 && format.bitDepth == 10) {
++		fmt = Format::Csi2Packed10;
++		rowBytes = (size.width + 3) / 4 * 5;
++	} else if (format.packing == BayerFormat::Packing::None &&
++		   format.bitDepth == 8) {
++		fmt = Format::Raw8;
++		rowBytes = size.width;
++	} else if (format.packing == BayerFormat::Packing::None &&
++		   format.bitDepth > 8 && format.bitDepth <= 16) {
++		fmt = Format::Raw16;
++		rowBytes = size.width * 2;
++	} else {
++		LOG(PdafPixels, Warning)
++			<< "Raw format " << format
++			<< " is not supported, not correcting phase-detection pixels";
++		return -ENOTSUP;
++	}
++
++	if (stride < rowBytes)
++		return -EINVAL;
++
++	std::vector<std::vector<unsigned int>> rowSites(pattern.period.height);
++	for (const Point &site : pattern.sites) {
++		if (site.x < 0 || site.y < 0 ||
++		    static_cast<unsigned int>(site.x) >= pattern.period.width ||
++		    static_cast<unsigned int>(site.y) >= pattern.period.height) {
++			LOG(PdafPixels, Warning)
++				<< "Ignoring phase-detection site " << site
++				<< " outside the " << pattern.period << " period";
++			continue;
++		}
++
++		rowSites[site.y].push_back(site.x);
++	}
++
++	for (auto &sites : rowSites)
++		std::sort(sites.begin(), sites.end());
++
++	format_ = fmt;
++	size_ = size;
++	stride_ = stride;
++	minDataSize_ = static_cast<size_t>(stride) * (size.height - 1) + rowBytes;
++	periodWidth_ = pattern.period.width;
++	rowSites_ = std::move(rowSites);
++
++	return 0;
++}
++
++/**
++ * \brief Disable the correction
++ */
++void PdafPixelCorrector::disable()
++{
++	format_ = Format::None;
++	rowSites_.clear();
++}
++
++/**
++ * \fn PdafPixelCorrector::isEnabled()
++ * \brief Check if the correction is enabled
++ * \return True if configure() enabled the correction
++ */
++
++/**
++ * \brief Correct the phase-detection pixels of a raw frame in place
++ * \param[in] data The mapped raw frame, which must be writable
++ *
++ * \return True if the frame was corrected, false if the correction is disabled
++ * or the buffer is too small for the configured frame
++ */
++bool PdafPixelCorrector::correct(Span<uint8_t> data) const
++{
++	if (!isEnabled() || data.size() < minDataSize_)
++		return false;
++
++	switch (format_) {
++	case Format::Csi2Packed10:
++		correctFrame<PixelCsi2Packed10>(data.data());
++		break;
++	case Format::Raw8:
++		correctFrame<PixelRaw8>(data.data());
++		break;
++	case Format::Raw16:
++		correctFrame<PixelRaw16>(data.data());
++		break;
++	case Format::None:
++		return false;
++	}
++
++	return true;
++}
++
++template<typename Pixel>
++void PdafPixelCorrector::correctFrame(uint8_t *data) const
++{
++	const unsigned int width = size_.width;
++	const unsigned int height = size_.height;
++	unsigned int tileRow = 0;
++
++	for (unsigned int y = 0; y < height; y++) {
++		const std::vector<unsigned int> &sites = rowSites_[tileRow];
++		if (++tileRow == rowSites_.size())
++			tileRow = 0;
++		if (sites.empty())
++			continue;
++
++		uint8_t *row = data + static_cast<size_t>(y) * stride_;
++		const uint8_t *above = y >= 2 ? row - 2 * static_cast<size_t>(stride_) : nullptr;
++		const uint8_t *below = y + 2 < height ? row + 2 * static_cast<size_t>(stride_) : nullptr;
++
++		for (unsigned int tileX = 0; tileX < width; tileX += periodWidth_) {
++			for (unsigned int siteX : sites) {
++				unsigned int x = tileX + siteX;
++				if (x >= width)
++					break;
++
++				unsigned int sum = 0;
++				unsigned int count = 0;
++
++				if (x >= 2) {
++					sum += Pixel::get(row, x - 2);
++					count++;
++				}
++				if (x + 2 < width) {
++					sum += Pixel::get(row, x + 2);
++					count++;
++				}
++				if (above) {
++					sum += Pixel::get(above, x);
++					count++;
++				}
++				if (below) {
++					sum += Pixel::get(below, x);
++					count++;
++				}
++
++				if (count)
++					Pixel::set(row, x, (sum + count / 2) / count);
++			}
++		}
++	}
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 56c5da8..d4d28b2 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/camera_sensor_properties.h"
+ #include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/software_isp/debayer_params.h"
+ 
+@@ -98,6 +99,8 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 		return;
+ 	}
+ 
++	sensorProps_ = CameraSensorProperties::get(sensor->model());
++
+ 	const CameraManager &cm = *pipe->cameraManager();
+ 
+ 	auto stats = std::make_unique<SwStatsCpu>(cm);
+@@ -303,6 +306,10 @@ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* Repair sensor-specific defects of the raw frames, if there are any */
++	if (sensorProps_)
++		debayer_->configurePdaf(sensorProps_->phaseDetectionPixels, inputCfg);
++
+ 	LOG(SoftwareIsp, Info)
+ 		<< "Input " << inputCfg.size
+ 		<< "-" << BayerFormat::fromPixelFormat(inputCfg.pixelFormat)
+diff --git a/test/meson.build b/test/meson.build
+index e445062..9af771d 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -65,6 +65,7 @@ internal_tests = [
+     {'name': 'object', 'sources': ['object.cpp']},
+     {'name': 'object-delete', 'sources': ['object-delete.cpp']},
+     {'name': 'object-invoke', 'sources': ['object-invoke.cpp']},
++    {'name': 'pdaf-pixels', 'sources': ['pdaf-pixels.cpp']},
+     {'name': 'pixel-format', 'sources': ['pixel-format.cpp']},
+ #    {'name': 'shared-fd', 'sources': ['shared-fd.cpp']},
+     {'name': 'signal-threads', 'sources': ['signal-threads.cpp']},
+diff --git a/test/pdaf-pixels.cpp b/test/pdaf-pixels.cpp
+new file mode 100644
+index 0000000..c98a797
+--- /dev/null
++++ b/test/pdaf-pixels.cpp
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2026, Pascal Garber
++ *
++ * Phase-detection pixel correction tests
++ */
++
++#include <iostream>
++#include <vector>
++
++#include <libcamera/geometry.h>
++
++#include "libcamera/internal/bayer_format.h"
++#include "libcamera/internal/camera_sensor_properties.h"
++#include "libcamera/internal/software_isp/pdaf_pixels.h"
++
++#include "test.h"
++
++using namespace std;
++using namespace libcamera;
++
++class PdafPixelsTest : public Test
++{
++protected:
++	static constexpr unsigned int kWidth = 64;
++	static constexpr unsigned int kHeight = 48;
++	static constexpr unsigned int kStride = 96;
++	static constexpr uint8_t kPadding = 0xa5;
++
++	static unsigned int get(const vector<uint8_t> &buf, unsigned int x, unsigned int y)
++	{
++		const uint8_t *g = &buf[y * kStride + (x >> 2) * 5];
++		unsigned int i = x & 3;
++
++		return (g[i] << 2) | ((g[4] >> (2 * i)) & 3);
++	}
++
++	static void set(vector<uint8_t> &buf, unsigned int x, unsigned int y, unsigned int v)
++	{
++		uint8_t *g = &buf[y * kStride + (x >> 2) * 5];
++		unsigned int i = x & 3;
++
++		g[i] = v >> 2;
++		g[4] = (g[4] & ~(3 << (2 * i))) | ((v & 3) << (2 * i));
++	}
++
++	static unsigned int gradient(unsigned int x, unsigned int y)
++	{
++		return 100 + 5 * x + 7 * y + ((x * 3 + y) & 3);
++	}
++
++	int run()
++	{
++		CameraSensorProperties::PhaseDetectionPixels pattern;
++		pattern.outputSize = { kWidth, kHeight };
++		pattern.period = { 16, 16 };
++		pattern.sites = { { 1, 1 }, { 9, 1 }, { 5, 5 }, { 13, 5 },
++				  { 5, 9 }, { 13, 9 }, { 1, 13 }, { 9, 13 } };
++
++		auto isSite = [&](unsigned int x, unsigned int y) {
++			for (const Point &p : pattern.sites)
++				if (x % 16 == static_cast<unsigned int>(p.x) &&
++				    y % 16 == static_cast<unsigned int>(p.y))
++					return true;
++			return false;
++		};
++
++		vector<uint8_t> buf(kStride * kHeight, kPadding);
++		for (unsigned int y = 0; y < kHeight; y++)
++			for (unsigned int x = 0; x < kWidth; x++)
++				set(buf, x, y, gradient(x, y));
++
++		/* Corrupt the sites by 1.7x */
++		for (unsigned int y = 0; y < kHeight; y++)
++			for (unsigned int x = 0; x < kWidth; x++)
++				if (isSite(x, y))
++					set(buf, x, y, gradient(x, y) * 17 / 10);
++
++		vector<uint8_t> corrupted = buf;
++
++		BayerFormat fmt(BayerFormat::RGGB, 10, BayerFormat::Packing::CSI2);
++		PdafPixelCorrector corrector;
++		if (corrector.configure(pattern, { kWidth, kHeight }, kStride, fmt)) {
++			cerr << "configure failed" << endl;
++			return TestFail;
++		}
++
++		if (corrector.configure(pattern, { kWidth, kHeight + 2 }, kStride, fmt) == 0 ||
++		    corrector.isEnabled()) {
++			cerr << "mismatching size must disable the correction" << endl;
++			return TestFail;
++		}
++
++		if (corrector.configure(pattern, { kWidth, kHeight }, kStride, fmt)) {
++			cerr << "re-configure failed" << endl;
++			return TestFail;
++		}
++
++		if (!corrector.correct({ buf.data(), buf.size() })) {
++			cerr << "correct() did nothing" << endl;
++			return TestFail;
++		}
++
++		for (unsigned int y = 0; y < kHeight; y++) {
++			for (unsigned int x = 0; x < kWidth; x++) {
++				unsigned int v = get(buf, x, y);
++
++				if (!isSite(x, y)) {
++					if (v != get(corrupted, x, y)) {
++						cerr << "non-site pixel " << x << "," << y << " changed" << endl;
++						return TestFail;
++					}
++					continue;
++				}
++
++				unsigned int sum = 0, n = 0;
++				if (x >= 2) { sum += get(corrupted, x - 2, y); n++; }
++				if (x + 2 < kWidth) { sum += get(corrupted, x + 2, y); n++; }
++				if (y >= 2) { sum += get(corrupted, x, y - 2); n++; }
++				if (y + 2 < kHeight) { sum += get(corrupted, x, y + 2); n++; }
++				unsigned int expected = (sum + n / 2) / n;
++
++				if (v != expected) {
++					cerr << "site " << x << "," << y << " is " << v
++					     << ", expected " << expected << endl;
++					return TestFail;
++				}
++			}
++
++			for (unsigned int i = (kWidth / 4) * 5; i < kStride; i++)
++				if (buf[y * kStride + i] != kPadding) {
++					cerr << "padding changed in row " << y << endl;
++					return TestFail;
++				}
++		}
++
++		/* Edge sites, e.g. (1,1) and (1,13) in column 1, have only 3 neighbours */
++		if (get(buf, 1, 1) != (get(corrupted, 3, 1) + get(corrupted, 1, 3) + 1) / 2) {
++			cerr << "corner site did not use in-frame neighbours only" << endl;
++			return TestFail;
++		}
++
++		/* Unsupported format is rejected */
++		BayerFormat fmt12(BayerFormat::RGGB, 12, BayerFormat::Packing::CSI2);
++		if (corrector.configure(pattern, { kWidth, kHeight }, kStride, fmt12) == 0) {
++			cerr << "unsupported format accepted" << endl;
++			return TestFail;
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(PdafPixelsTest)
+-- 
+2.56.1
+

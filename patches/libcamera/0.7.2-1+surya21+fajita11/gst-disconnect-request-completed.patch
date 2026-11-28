@@ -1,0 +1,27 @@
+Subject: gstreamer: disconnect requestCompleted when the camera is closed
+
+libcamerasrc connects the camera's requestCompleted signal on every open and
+never disconnects it. When the camera manager outlives the session (in neo-camera
+it did on some switches: 4 opens, 3 managers), opening that camera again
+delivers each request twice: a use-after-free in readMetadata() or a wrong
+pop of queuedRequests_. neo-camera crashed on front/back switches (S10e).
+
+--- a/src/gstreamer/gstlibcamerasrc.cpp	2026-11-12 06:21:11.254791416 +0100
++++ b/src/gstreamer/gstlibcamerasrc.cpp	2026-11-12 06:21:11.282581477 +0100
+@@ -962,6 +962,16 @@
+ 
+ 	state->config_.reset();
+ 
++	/*
++	 * Undo the connect() of gst_libcamera_src_open(). The camera manager can
++	 * outlive this session (a device monitor, or another element, holds it),
++	 * and with it the camera: opened again, it would deliver every request
++	 * to this handler once per earlier session. The second delivery reads a
++	 * request the first one already freed, or pops the next queued request
++	 * ("wrap->request_.get() == request" fails) and frees it under libcamera.
++	 */
++	state->cam_->requestCompleted.disconnect(state, &GstLibcameraSrcState::requestCompleted);
++
+ 	ret = state->cam_->release();
+ 	if (ret) {
+ 		GST_ELEMENT_WARNING(self, RESOURCE, BUSY,
