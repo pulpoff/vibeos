@@ -1,0 +1,60 @@
+Index: libcamera-0.7.2/src/ipa/libipa/camera_sensor_helper.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/libipa/camera_sensor_helper.cpp
++++ libcamera-0.7.2/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -642,6 +642,55 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx477", CameraSensorHelperImx477)
+ 
++/*
++ * The POCO X3 NFC (surya) cameras. Without a helper the soft ISP drove their
++ * raw gain codes as if they were gains: from code 0 a step of 6% is no step,
++ * and in the dark the picture brightened one code a frame for seconds.
++ */
++class CameraSensorHelperImx682 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx682()
++	{
++		/* Sony: gain = 1024 / (1024 - code), 1x .. 22x at 978 */
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx682", CameraSensorHelperImx682)
++
++class CameraSensorHelperS5k3t2 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3t2()
++	{
++		/* Samsung: code = 32 * gain, 1x .. 16x */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3t2", CameraSensorHelperS5k3t2)
++
++class CameraSensorHelperHi259 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperHi259()
++	{
++		/* the driver takes 64 * gain (MediaTek's BASEGAIN), 1x .. 14x */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 64 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("hi259", CameraSensorHelperHi259)
++
++class CameraSensorHelperHi1337 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperHi1337()
++	{
++		/* gain = 1 + code / 16, 1x .. 16x, as hi846 */
++		gain_ = AnalogueGainLinear{ 1, 16, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("hi1337", CameraSensorHelperHi1337)
++
+ class CameraSensorHelperImx678 : public CameraSensorHelper
+ {
+ public:

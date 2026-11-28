@@ -1,0 +1,111 @@
+From f9ba59eeed4321f20595357c600e6c23112ae4d9 Mon Sep 17 00:00:00 2001
+From: Xander Pronk <xander.c.pronk@gmail.com>
+Date: Thu, 22 Oct 2026 11:40:44 +0200
+Subject: [PATCH 11/16] libcamera: software_isp: Add LSC data to DebayerParams
+
+Add a lookup table for grid-based lens shading correction to debayer
+params.  The lookup table is in the format of an RGBA texture to be
+passed to debayering.  The alpha value serves only for padding and can
+be arbitrary; OpenGL wants by default rows aligned to 4 bytes and using
+RGBA format is the simplest way to achieve it.
+
+The parameter is filled in by Lsc algorithm implemented in a follow-up
+patch.  If the algorithm is not enabled, the table is filled in with
+values corresponding to identity multiplication (1.0).
+
+In order the image processing would be able to update its internal
+data (e.g. the GPU texture) on and only on the lookup table changes,
+lscLutVersion parameter is added, which is incremented on each lookup
+table change.
+
+The parameters are currently unused, their handling is implemented in
+follow-up patches.
+
+The grid size is selected to be the same as in the tuning files already
+present in rkisp1.  Another popular grid size in other pipelines is 32.
+
+Co-developed-by: Rick ten Wolde <rick_libcamera@wolde.info>
+Signed-off-by: Rick ten Wolde <rick_libcamera@wolde.info>
+Signed-off-by: Xander Pronk <xander.c.pronk@gmail.com>
+Signed-off-by: Milan Zamazal <mzamazal@redhat.com>
+Reviewed-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+Signed-off-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+(cherry picked from commit dfc7c9a4b601dfed48c4139abe772b735408b822)
+---
+ .../internal/software_isp/debayer_params.h    | 13 +++++++++
+ src/libcamera/software_isp/debayer.cpp        | 28 +++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 63d9dc8..659e198 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -10,6 +10,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <stdint.h>
+ 
+ #include "libcamera/internal/matrix.h"
+@@ -32,6 +33,18 @@ struct DebayerParams {
+ 	 * frame for it on every frame cost 7 ms a frame, all the time.
+ 	 */
+ 	bool focusEveryFrame = false;
++
++	/**
++	 * To prevent OpenGL alignment issues, the number of bytes in each row
++	 * must be a multiple of 4 (the initial value of GL_UNPACK_ALIGNMENT)
++	 * and lscLut is also aligned to 4 bytes.
++	 **/
++	static constexpr unsigned int kLscGridSize = 17;
++	static constexpr unsigned int kLscValuesPerCell = 4;
++	using LscLookupTable =
++		std::array<uint8_t, kLscGridSize * kLscGridSize * kLscValuesPerCell>;
++	alignas(4) LscLookupTable lscLut{};
++	uint64_t lscLutVersion = 0;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index 56446f5..b156530 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -43,6 +43,34 @@ namespace libcamera {
+  * \brief Contrast value to be used as an exponent
+  */
+ 
++/**
++ * \var DebayerParams::kLscGridSize
++ * \brief Number of lens shading grid areas in one direction
++ */
++
++/**
++ * \var DebayerParams::kLscValuesPerCell
++ * \brief Number of pixel values per each of the lens shading grid areas
++ */
++
++/**
++ * \typedef DebayerParams::LscLookupTable
++ * \brief Lookup table for lens shading correction
++ *
++ * It's an array of values to be later used as a texture.
++ * The values are in row - column - RGB order.
++ */
++
++/**
++ * \var DebayerParams::lscLut
++ * \brief Lens shading lookup table
++ */
++
++/**
++ * \var DebayerParams::lscLutVersion
++ * \brief Incremented on each \a lscLut change
++ */
++
+ /**
+  * \class Debayer
+  * \brief Base debayering class
+-- 
+2.56.1
+

@@ -1,0 +1,235 @@
+From 10a9f57dc39423d25d0aeddc2a2a52584902f19b Mon Sep 17 00:00:00 2001
+From: Milan Zamazal <mzamazal@redhat.com>
+Date: Thu, 22 Oct 2026 11:40:47 +0200
+Subject: [PATCH 13/16] libcamera: software_isp: Pass LSC availability to
+ debayering
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The lens shading algorithm may or may not be enabled in the tuning file.
+Debayering configuration needs this information to arrange things
+accordingly, e.g. to set up shader parameters.
+
+Let's add a corresponding flag that is set in the LSC algorithm (if
+present) and passed to Debayer::configure.  This is similar to what we
+already do with CCM availability.
+
+The flag is ignored by CPU ISP, where LSC is not going to be implemented
+for now.
+
+Signed-off-by: Milan Zamazal <mzamazal@redhat.com>
+Reviewed-by: Bryan O'Donoghue <bod.linux@nxsw.ie>
+Reviewed-by: Barnabás Pőcze <barnabas.pocze@ideasonboard.com>
+Signed-off-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+(cherry picked from commit edee04703a3c68ddf2ec4646bf843517bb21ac10)
+---
+ include/libcamera/internal/software_isp/software_isp.h | 1 +
+ include/libcamera/ipa/soft.mojom                       | 4 +++-
+ src/ipa/simple/ipa_context.h                           | 1 +
+ src/ipa/simple/soft_simple.cpp                         | 7 +++++--
+ src/libcamera/software_isp/debayer.cpp                 | 1 +
+ src/libcamera/software_isp/debayer.h                   | 3 ++-
+ src/libcamera/software_isp/debayer_cpu.cpp             | 3 ++-
+ src/libcamera/software_isp/debayer_cpu.h               | 3 ++-
+ src/libcamera/software_isp/debayer_egl.cpp             | 5 ++++-
+ src/libcamera/software_isp/debayer_egl.h               | 4 +++-
+ src/libcamera/software_isp/software_isp.cpp            | 5 +++--
+ 11 files changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index f7a9a20..289467c 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -101,6 +101,7 @@ private:
+ 	DebayerParams debayerParams_;
+ 	DmaBufAllocator dmaHeap_;
+ 	bool ccmEnabled_;
++	bool lscEnabled_;
+ 
+ 	std::unique_ptr<ipa::soft::IPAProxySoft> ipa_;
+ 	std::deque<FrameBuffer *> queuedInputBuffers_;
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index b391335..7d39f0e 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -19,7 +19,9 @@ interface IPASoftInterface {
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls,
+ 	     libcamera.ControlInfoMap lensControls)
+-		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
++		=> (int32 ret,
++		    libcamera.ControlInfoMap ipaControls,
++		    bool ccmEnabled, bool lscEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 8ec2234..036b7c7 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -104,6 +104,7 @@ struct IPAContext {
+ 	FCQueue<IPAFrameContext> frameContexts;
+ 	ControlInfoMap::Map ctrlMap;
+ 	bool ccmEnabled = false;
++	bool lscEnabled = false;
+ };
+ 
+ } /* namespace ipa::soft */
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 6e16062..cce6307 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -58,7 +58,8 @@ public:
+ 		 const ControlInfoMap &sensorControls,
+ 		 const ControlInfoMap &lensControls,
+ 		 ControlInfoMap *ipaControls,
+-		 bool *ccmEnabled) override;
++		 bool *ccmEnabled,
++		 bool *lscEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+ 
+ 	int start() override;
+@@ -100,7 +101,8 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			const ControlInfoMap &sensorControls,
+ 		 const ControlInfoMap &lensControls,
+ 			ControlInfoMap *ipaControls,
+-			bool *ccmEnabled)
++			bool *ccmEnabled,
++			bool *lscEnabled)
+ {
+ 	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
+ 	if (!camHelper_) {
+@@ -148,6 +150,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 		return ret;
+ 
+ 	*ccmEnabled = context_.ccmEnabled;
++	*lscEnabled = context_.lscEnabled;
+ 
+ 	params_ = nullptr;
+ 	stats_ = nullptr;
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index b156530..ce99e3c 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -99,6 +99,7 @@ Debayer::~Debayer()
+  * \param[in] inputCfg The input configuration
+  * \param[in] outputCfgs The output configurations
+  * \param[in] ccmEnabled Whether a color correction matrix is applied
++ * \param[in] lscEnabled Whether lens shading correction grid is provided
+  *
+  * \return 0 on success, a negative errno on failure
+  */
+diff --git a/src/libcamera/software_isp/debayer.h b/src/libcamera/software_isp/debayer.h
+index 28f1b85..d6dc24d 100644
+--- a/src/libcamera/software_isp/debayer.h
++++ b/src/libcamera/software_isp/debayer.h
+@@ -40,7 +40,8 @@ public:
+ 
+ 	virtual int configure(const StreamConfiguration &inputCfg,
+ 			      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			      bool ccmEnabled) = 0;
++			      bool ccmEnabled,
++			      bool lscEnabled) = 0;
+ 
+ 	virtual std::vector<PixelFormat> formats(PixelFormat inputFormat) = 0;
+ 
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 6c8f675..9cab6b7 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -641,7 +641,8 @@ int DebayerCpu::setDebayerFunctions(PixelFormat inputFormat,
+ 
+ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  bool ccmEnabled)
++			  bool ccmEnabled,
++			  [[maybe_unused]] bool lscEnabled)
+ {
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+diff --git a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
+index 5281c65..a3c24d0 100644
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -37,7 +37,8 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled,
++		      bool lscEnabled) override;
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 	std::vector<PixelFormat> formats(PixelFormat input) override;
+ 	std::tuple<unsigned int, unsigned int>
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index b2c9974..f258bc1 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -287,7 +287,8 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 
+ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 			  const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			  [[maybe_unused]] bool ccmEnabled)
++			  [[maybe_unused]] bool ccmEnabled,
++			  bool lscEnabled)
+ {
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+@@ -304,6 +305,8 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 		return -EINVAL;
+ 	}
+ 
++	lscEnabled_ = lscEnabled;
++
+ 	inputConfig_.stride = inputCfg.stride;
+ 	inputPixelFormat_ = inputCfg.pixelFormat;
+ 	width_ = inputCfg.size.width;
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index c60e823..900b73d 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -45,7 +45,8 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      bool ccmEnabled) override;
++		      bool ccmEnabled,
++		      bool lscEnabled) override;
+ 
+ 	Size patternSize(PixelFormat inputFormat) override;
+ 
+@@ -83,6 +84,7 @@ private:
+ 	unsigned int inputBufferCount_;
+ 	unsigned int outputBufferCount_;
+ 
++	bool lscEnabled_;
+ 	/* Shader parameters */
+ 	float firstRed_x_;
+ 	float firstRed_y_;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 153b4d8..56c5da8 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -165,7 +165,8 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 			 sensor->controls(),
+ 			 const_cast<CameraSensor *>(sensor)->focusLens() ? const_cast<CameraSensor *>(sensor)->focusLens()->controls() : ControlInfoMap{},
+ 			 ipaControls,
+-			 &ccmEnabled_);
++			 &ccmEnabled_,
++			 &lscEnabled_);
+ 	if (ret) {
+ 		LOG(SoftwareIsp, Error) << "IPA init failed";
+ 		debayer_.reset();
+@@ -298,7 +299,7 @@ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_);
++	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_, lscEnabled_);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-- 
+2.56.1
+

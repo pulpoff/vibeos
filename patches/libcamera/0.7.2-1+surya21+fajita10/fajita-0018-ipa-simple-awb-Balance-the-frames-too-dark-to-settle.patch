@@ -1,0 +1,194 @@
+From 260a51f9f78c4461a2dbec610303330c4b6229ea Mon Sep 17 00:00:00 2001
+From: Pascal Garber <pascal@artandcode.studio>
+Date: Sat, 28 Nov 2026 17:42:35 +0100
+Subject: [PATCH] ipa: simple: awb: Balance the frames too dark to settle on
+
+Settling waits up to 30 frames for a well exposed frame. Switching to
+the front camera of a OnePlus 6T in a lamp-lit room waited all 30 at
+the longest exposure, about 4.6 seconds, and the start gains (1, 1)
+showed the room yellow-green meanwhile.
+
+Show those frames with their own grey world estimate, without counting
+them towards settling, once green averages two levels above black. The
+first well exposed frame replaces the estimate in full.
+---
+ src/ipa/simple/algorithms/awb.cpp | 21 ++++++--
+ src/ipa/simple/algorithms/awb.h   |  2 +
+ test/ipa/meson.build              |  6 +++
+ test/ipa/soft_simple_awb.cpp      | 89 +++++++++++++++++++++++++++++++
+ 4 files changed, 113 insertions(+), 5 deletions(-)
+ create mode 100644 test/ipa/soft_simple_awb.cpp
+
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index fb30288..41bd801 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -117,16 +117,27 @@ void Awb::process(IPAContext &context,
+ 	 * blue gain of 1.27 against 1.75 from a well exposed frame. The
+ 	 * near-neutral refinement never left it. A scene that stays dark (the
+ 	 * longest exposure at night) settles after kSettleWaitFrames anyway.
++	 *
++	 * Meanwhile the dark frame's grey world is shown, not counted. A switch
++	 * to the front camera in a lamp-lit room waited the 30 frames at its
++	 * longest exposure, 4.6 seconds, and the start gains (1, 1) showed the
++	 * room yellow-green all that time. The dark estimate may be a third
++	 * off, which is still far closer than no correction.
+ 	 */
++	bool provisional = false;
+ 	if (settling) {
+ 		const bool exposed = sum.g() >= count * kSettleMinLevel;
+ 		if (!exposed && settleWait_ < kSettleWaitFrames) {
+ 			settleWait_++;
+-			LOG(IPASoftAwb, Debug)
+-				<< "green " << sum.g() / count << " above black, too dark to settle";
+-			return;
++			if (sum.g() < count * kProvisionalMinLevel) {
++				LOG(IPASoftAwb, Debug)
++					<< "green " << sum.g() / count << " above black, too dark to settle";
++				return;
++			}
++			provisional = true;
++		} else {
++			startFrames_++;
+ 		}
+-		startFrames_++;
+ 	}
+ 
+ 	/*
+@@ -192,7 +203,7 @@ void Awb::process(IPAContext &context,
+ 		<< "gain R/B: " << gains << "; temperature: "
+ 		<< context.activeState.awb.temperatureK
+ 		<< "; green " << sum.g() / count << " above black, "
+-		<< (neutral ? "near-neutral " : (settling ? "settling " : "grey world "))
++		<< (neutral ? "near-neutral " : (provisional ? "provisional " : (settling ? "settling " : "grey world ")))
+ 		<< 100 * stats->neutralCount / nPixels << "% neutral";
+ }
+ 
+diff --git a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+index ee569c3..2aac4ed 100644
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -35,6 +35,8 @@ private:
+ 	/* mean green above black, in 8-bit levels, for a frame to settle on */
+ 	static constexpr uint64_t kSettleMinLevel = 24;
+ 	static constexpr unsigned int kSettleWaitFrames = 30;
++	/* mean green above black, in 8-bit levels, for a frame to be shown balanced before settling */
++	static constexpr uint64_t kProvisionalMinLevel = 2;
+ 
+ 	unsigned int startFrames_ = 0;	/* estimates taken since the stream started */
+ 	unsigned int settleWait_ = 0;	/* frames too dark to settle on */
+diff --git a/test/ipa/meson.build b/test/ipa/meson.build
+index b226d97..0e8a121 100644
+--- a/test/ipa/meson.build
++++ b/test/ipa/meson.build
+@@ -8,6 +8,12 @@ ipa_test = [
+ ]
+ 
+ ipa_test += [
++    {
++        'name': 'soft_simple_awb',
++        'sources': ['soft_simple_awb.cpp',
++                    '../../src/ipa/simple/algorithms/awb.cpp',
++                    '../../src/ipa/simple/ipa_context.cpp'],
++    },
+     {
+         'name': 'soft_simple_lsc',
+         'sources': ['soft_simple_lsc.cpp',
+diff --git a/test/ipa/soft_simple_awb.cpp b/test/ipa/soft_simple_awb.cpp
+new file mode 100644
+index 0000000..0775c41
+--- /dev/null
++++ b/test/ipa/soft_simple_awb.cpp
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Software ISP auto white balance algorithm test
++ */
++
++#include <cmath>
++#include <iostream>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++
++#include "libcamera/internal/software_isp/swisp_stats.h"
++
++#include "algorithms/awb.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace ipa::soft;
++
++class SoftSimpleAwbTest : public Test
++{
++protected:
++	static constexpr uint64_t kPixels = 10000;
++	static constexpr uint8_t kBlack = 16;
++
++	/* one frame with the given mean levels above black and no near-neutral pixels */
++	void process(algorithms::Awb &awb, IPAContext &context, double r, double g, double b)
++	{
++		SwIspStats stats{};
++		stats.valid = true;
++		stats.yHistogram[10] = kPixels;
++		stats.sum_ = RGB<uint64_t>({ static_cast<uint64_t>(kPixels * (kBlack + r)),
++					     static_cast<uint64_t>(kPixels * (kBlack + g)),
++					     static_cast<uint64_t>(kPixels * (kBlack + b)) });
++		stats.neutralCount = 0;
++
++		IPAFrameContext &fc = context.frameContexts.alloc(frame_);
++		ControlList metadata(controls::controls);
++		awb.process(context, frame_, fc, &stats, metadata);
++		frame_++;
++	}
++
++	static bool near(double a, double b)
++	{
++		return std::abs(a - b) < 0.01;
++	}
++
++	int run() override
++	{
++		IPAContext context(8);
++		context.activeState.blc.level = kBlack;
++		algorithms::Awb awb;
++		IPAConfigInfo info;
++		awb.configure(context, info);
++		const auto &gains = context.activeState.awb.gains;
++
++		/*
++		 * Too dark to settle (green 3 levels above black under a lamp):
++		 * shown with the dark frame's grey world, 2.5 / 3 / 1.
++		 */
++		process(awb, context, 2.5, 3, 1);
++		if (!near(gains.r(), 1.2 * 1.05) || !near(gains.b(), 3 * 0.92)) {
++			std::cerr << "dark frame not balanced: " << gains << std::endl;
++			return TestFail;
++		}
++
++		/* Below two levels the gains are kept. */
++		process(awb, context, 1.5, 1.5, 1.5);
++		if (!near(gains.r(), 1.2 * 1.05) || !near(gains.b(), 3 * 0.92)) {
++			std::cerr << "too dark a frame changed the gains: " << gains << std::endl;
++			return TestFail;
++		}
++
++		/* A well exposed frame settles in full, replacing the dark estimate. */
++		process(awb, context, 32, 40, 20);
++		if (!near(gains.r(), 1.25 * 1.05) || !near(gains.b(), 2 * 0.92)) {
++			std::cerr << "exposed frame did not settle: " << gains << std::endl;
++			return TestFail;
++		}
++
++		return TestPass;
++	}
++
++private:
++	uint32_t frame_ = 0;
++};
++
++TEST_REGISTER(SoftSimpleAwbTest)
+-- 
+2.56.1
+

@@ -1,0 +1,40 @@
+From 0a3c6a1b841331a28a5938c0fb1f6701d8fe87dc Mon Sep 17 00:00:00 2001
+From: Lolren <loren.bufanu@gmail.com>
+Date: Sun, 23 Aug 2026 17:33:58 +0100
+Subject: [PATCH 3/4] ipa: libipa: Add Sony IMX519 helper
+
+The simple IPA currently treats IMX519 analogue gain register codes as linear gain factors, producing unstable exposure behaviour.
+
+The existing Raspberry Pi IMX519 camera helper implements gain as 1024 / (1024 - code), and the existing Raspberry Pi IMX519 tuning data specifies a 10-bit black level of 0x40. Add the equivalent generic CameraSensorHelper for use by the simple IPA and other pipelines.
+
+Signed-off-by: Loren Bufanu <loren.bufanu@gmail.com>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 4865e25..2d4eb90 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -691,6 +691,18 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx477", CameraSensorHelperImx477)
+ 
++class CameraSensorHelperImx519 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx519()
++	{
++		/* From the Raspberry Pi tuning data: 0x40 at 10 bits. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx519", CameraSensorHelperImx519)
++
+ /*
+  * The POCO X3 NFC (surya) cameras. Without a helper the soft ISP drove their
+  * raw gain codes as if they were gains: from code 0 a step of 6% is no step,
+-- 
+2.56.1
+

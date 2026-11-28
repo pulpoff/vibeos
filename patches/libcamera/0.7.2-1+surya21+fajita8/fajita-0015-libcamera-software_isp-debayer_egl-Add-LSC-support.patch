@@ -1,0 +1,210 @@
+From 21364320adc6dc3d55464be9f30a162a3115de75 Mon Sep 17 00:00:00 2001
+From: Xander Pronk <xander.c.pronk@gmail.com>
+Date: Thu, 22 Oct 2026 11:40:48 +0200
+Subject: [PATCH 15/16] libcamera: software_isp: debayer_egl: Add LSC support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add support for passing the LSC table from debayerParams to the shaders.
+
+We use 8-bit texture with the original UQ<2, 6> values to avoid trouble
+with floats.  32-bit floats don't work in my environment and 16-bit
+floats may not be supported in all OpenGL environments.
+
+When LSC is disabled by the runtime control, we provide a constant 1.0
+correction table, i.e. a no-op table.  This is preferred to having a
+runtime flag, to not disturb GPU computation with runtime switches,
+assuming that disabling LSC in runtime is not a common use case.
+
+The LSC texture is created once and then updated.  The texture creation
+cannot be done in `configure', because of a different thread.
+
+Co-developed-by: Rick ten Wolde <rick_libcamera@wolde.info>
+Signed-off-by: Rick ten Wolde <rick_libcamera@wolde.info>
+Signed-off-by: Xander Pronk <xander.c.pronk@gmail.com>
+Signed-off-by: Milan Zamazal <mzamazal@redhat.com>
+Tested-by: Barnabás Pőcze <barnabas.pocze@ideasonboard.com>
+Reviewed-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+Signed-off-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+(cherry picked from commit 323c0f3f7704590f0405ac4c8442d0f3658b6d46)
+---
+ include/libcamera/internal/egl.h              |  4 +--
+ .../internal/software_isp/debayer_params.h    |  2 ++
+ src/libcamera/egl.cpp                         |  4 +--
+ src/libcamera/software_isp/debayer.cpp        |  5 ++++
+ src/libcamera/software_isp/debayer_egl.cpp    | 30 ++++++++++++++++++-
+ src/libcamera/software_isp/debayer_egl.h      |  7 +++++
+ 6 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/include/libcamera/internal/egl.h b/include/libcamera/internal/egl.h
+index 97d3fc4..f3cc00a 100644
+--- a/include/libcamera/internal/egl.h
++++ b/include/libcamera/internal/egl.h
+@@ -108,8 +108,8 @@ public:
+ 
+ 	int createInputDMABufTexture2D(eGLImage &eglImage, int fd);
+ 	int createOutputDMABufTexture2D(eGLImage &eglImage, int fd);
+-	void createTexture2D(eGLImage &eglImage, void *data, GLint filter);
+-	void updateTexture2D(eGLImage &eglImage, void *data);
++	void createTexture2D(eGLImage &eglImage, const void *data, GLint filter);
++	void updateTexture2D(eGLImage &eglImage, const void *data);
+ 	void createOutputTexture2D(eGLImage &eglImage);
+ 
+ 	int attachTextureToFBO(eGLImage &eglImage);
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 659e198..00ac3c6 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -41,6 +41,8 @@ struct DebayerParams {
+ 	 **/
+ 	static constexpr unsigned int kLscGridSize = 17;
+ 	static constexpr unsigned int kLscValuesPerCell = 4;
++	static constexpr unsigned int kLscBytesPerCell =
++		kLscValuesPerCell * sizeof(uint8_t);
+ 	using LscLookupTable =
+ 		std::array<uint8_t, kLscGridSize * kLscGridSize * kLscValuesPerCell>;
+ 	alignas(4) LscLookupTable lscLut{};
+diff --git a/src/libcamera/egl.cpp b/src/libcamera/egl.cpp
+index a4acc62..b570208 100644
+--- a/src/libcamera/egl.cpp
++++ b/src/libcamera/egl.cpp
+@@ -316,7 +316,7 @@ int eGL::createOutputDMABufTexture2D(eGLImage &eglImage, int fd)
+  * is useful for uploading static data like lookup tables or uniform color
+  * matrices to the GPU.
+  */
+-void eGL::createTexture2D(eGLImage &eglImage, void *data, GLint filter)
++void eGL::createTexture2D(eGLImage &eglImage, const void *data, GLint filter)
+ {
+ 	ASSERT(tid_ == Thread::currentId());
+ 
+@@ -387,7 +387,7 @@ bool eGL::isAvailable()
+  *
+  * Updates a 2D texture in VRAM.
+  */
+-void eGL::updateTexture2D(eGLImage &eglImage, void *data)
++void eGL::updateTexture2D(eGLImage &eglImage, const void *data)
+ {
+ 	ASSERT(tid_ == Thread::currentId());
+ 
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index ce99e3c..522c223 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -53,6 +53,11 @@ namespace libcamera {
+  * \brief Number of pixel values per each of the lens shading grid areas
+  */
+ 
++/**
++ * \var DebayerParams::kLscBytesPerCell
++ * \brief Number of bytes per each of the lens shading grid areas
++ */
++
+ /**
+  * \typedef DebayerParams::LscLookupTable
+  * \brief Lookup table for lens shading correction
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 3021bbf..d46bdeb 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -129,6 +129,8 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	textureUniformBayerFirstRed_ = glGetUniformLocation(programId_, "tex_bayer_first_red");
+ 	textureUniformProjMatrix_ = glGetUniformLocation(programId_, "proj_matrix");
+ 
++	textureUniformLsc_ = glGetUniformLocation(programId_, "lsc_tex");
++
+ 	LOG(Debayer, Debug) << "vertexIn " << attributeVertex_ << " textureIn " << attributeTexture_
+ 			    << " tex_y " << textureUniformBayerDataIn_
+ 			    << " awb " << awbUniformDataIn_
+@@ -140,7 +142,8 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 			    << " tex_size " << textureUniformSize_
+ 			    << " stride_factor " << textureUniformStrideFactor_
+ 			    << " tex_bayer_first_red " << textureUniformBayerFirstRed_
+-			    << " proj_matrix " << textureUniformProjMatrix_;
++			    << " proj_matrix " << textureUniformProjMatrix_
++			    << " tex_lsc " << textureUniformLsc_;
+ 	return 0;
+ }
+ 
+@@ -157,6 +160,9 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	/* Specify GL_OES_EGL_image_external */
+ 	egl_.pushEnv(shaderEnv, "#extension GL_OES_EGL_image_external: enable");
+ 
++	if (lscEnabled_)
++		egl_.pushEnv(shaderEnv, "#define APPLY_LSC");
++
+ 	/*
+ 	 * Tell shaders how to re-order output taking account of how the pixels
+ 	 * are actually stored by EGL.
+@@ -504,6 +510,13 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	glUniformMatrix3fv(ccmUniformDataIn_, 1, GL_TRUE, params.combinedMatrix.data().data());
+ 	LOG(Debayer, Debug) << " ccmUniformDataIn_ " << ccmUniformDataIn_ << " data " << params.combinedMatrix;
+ 
++	if (lscEnabled_ && params.lscLutVersion != lscLutVersion_) {
++		egl_.updateTexture2D(*eglImageLscLookup_, params.lscLut.data());
++		lscLutVersion_ = params.lscLutVersion;
++		glUniform1i(textureUniformLsc_, eglImageLscLookup_->texture_unit_uniform_id_);
++		LOG(Debayer, Debug) << "LSC texture updated to version " << lscLutVersion_.value_or(-1);
++	}
++
+ 	/*
+ 	 * 0 = Red, 1 = Green, 2 = Blue
+ 	 */
+@@ -714,6 +727,18 @@ int DebayerEGL::start()
+ 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
+ 		return -EINVAL;
+ 
++	if (lscEnabled_) {
++		constexpr unsigned int gridSize = DebayerParams::kLscGridSize;
++		constexpr unsigned int stride = gridSize * DebayerParams::kLscBytesPerCell;
++		eglImageLscLookup_.emplace(GL_RGBA,
++					   gridSize,
++					   gridSize,
++					   stride,
++					   GL_TEXTURE2,
++					   2);
++		egl_.createTexture2D(*eglImageLscLookup_, nullptr, GL_LINEAR);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -722,6 +747,9 @@ void DebayerEGL::stop()
+ 	eglImageOutCache_.clear();
+ 	eglImageInCache_.clear();
+ 
++	eglImageLscLookup_.reset();
++	lscLutVersion_.reset();
++
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
+ 	programId_ = 0;
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 900b73d..78b23fb 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -84,7 +84,11 @@ private:
+ 	unsigned int inputBufferCount_;
+ 	unsigned int outputBufferCount_;
+ 
++	/* LSC lookup table */
+ 	bool lscEnabled_;
++	std::optional<eGLImage> eglImageLscLookup_;
++	std::optional<uint64_t> lscLutVersion_;
++
+ 	/* Shader parameters */
+ 	float firstRed_x_;
+ 	float firstRed_y_;
+@@ -102,6 +106,9 @@ private:
+ 	/* Per-frame AWB gains */
+ 	GLint awbUniformDataIn_;
+ 
++	/* Lens shading correction */
++	GLint textureUniformLsc_;
++
+ 	/* Represent per-frame CCM as a uniform vector of floats 3 x 3 */
+ 	GLint ccmUniformDataIn_;
+ 
+-- 
+2.56.1
+

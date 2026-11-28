@@ -1,0 +1,102 @@
+--- a/src/ipa/simple/algorithms/af.cpp
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -43,9 +43,13 @@ static constexpr double kFlat = 1.08;		/
+ static constexpr double kChangedLow = 0.75;	/* the scene changed: the measure left this band */
+ static constexpr double kChangedHigh = 1.4;
+ static constexpr double kSteady = 0.12;		/* and then held within this of itself */
+-static constexpr uint32_t kSettleFrames = 6;	/* a move shows 2 frames later and, with the VCM in SAC mode, has settled 2 frames after that */
+-static constexpr uint32_t kSettleLongFrames = 8;	/* one more after a long travel */
+-static constexpr uint32_t kStartFrames = 36;	/* the first scan waits for the exposure to settle (0.8 s) */
++/*
++ * Times, not frames: they were 6, 8 and 36 frames at the 30 fps they were tuned at, and the 60 fps video modes read
++ * every step in half the time, before the VCM had come to rest (the lens hunted, the picture stayed soft).
++ */
++static constexpr double kSettleSeconds = 0.2;		/* a move shows 2 frames later; the VCM in SAC mode rests ~130 ms after */
++static constexpr double kSettleLongSeconds = 0.267;	/* longer after a long travel */
++static constexpr double kStartSeconds = 1.2;		/* the first scan waits for the exposure to settle */
+ 
+ int Af::init(IPAContext &context, const ValueNode &tuningData)
+ {
+@@ -75,6 +79,20 @@ int Af::init(IPAContext &context, const
+ 
+ int Af::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
++	/*
++	 * Counted at 60 fps, the fastest the soft ISP delivers: the session's exposure limits do not give the frame
++	 * time reliably (they said 33 ms for 60 fps), and erring short only waits longer at 30 fps, never reads early.
++	 */
++	const double frame = 1.0 / 60;
++	auto frames = [frame](double seconds) {
++		return std::max<uint32_t>(3, static_cast<uint32_t>(std::ceil(seconds / frame)));
++	};
++	settleFrames_ = frames(kSettleSeconds);
++	settleLongFrames_ = std::max(settleFrames_ + 1, frames(kSettleLongSeconds));
++	startFrames_ = frames(kStartSeconds);
++	LOG(IPASoftAf, Debug) << "frame " << frame * 1e3 << " ms: settle " << settleFrames_ << "/" << settleLongFrames_
++			      << " frames, first scan at " << startFrames_;
++
+ 	mode_ = controls::AfModeContinuous;
+ 	state_ = controls::AfStateIdle;
+ 	phase_ = Phase::Idle;
+@@ -101,7 +119,7 @@ void Af::moveTo(IPAContext &context, int
+ {
+ 	position = std::clamp(position, min_, max_);
+ 	/* a long travel takes the VCM longer to settle: one frame more */
+-	settle_ = std::abs(position - context.activeState.lens.position) > (max_ - min_) / 6 ? kSettleLongFrames : kSettleFrames;
++	settle_ = std::abs(position - context.activeState.lens.position) > (max_ - min_) / 6 ? settleLongFrames_ : settleFrames_;
+ 	context.activeState.lens.position = position;
+ 	context.activeState.lens.changed = true;
+ 	movedAt_ = frame;
+@@ -176,6 +194,10 @@ bool Af::step(IPAContext &context, uint3
+ void Af::finishScan(IPAContext &context, uint32_t frame)
+ {
+ 	const bool flat = best_ < kFlat * worst_;
++	/* nothing to focus on (dark, blank wall, covered): the best of a flat curve is noise, often the macro end;
++	 * rest near infinity instead, where most of what the camera is pointed at next will be */
++	if (flat)
++		bestPos_ = std::min(max_, scanMin_ + coarseStep_);
+ 
+ 	state_ = flat ? controls::AfStateFailed : controls::AfStateFocused;
+ 	phase_ = Phase::Focused;
+@@ -248,7 +270,7 @@ void Af::process(IPAContext &context, co
+ 	}
+ 
+ 	if (mode_ == controls::AfModeContinuous && phase_ == Phase::Idle) {
+-		if (frame >= kStartFrames)
++		if (frame >= startFrames_)
+ 			startScan(context, frame);
+ 		return;
+ 	}
+@@ -288,8 +310,20 @@ void Af::process(IPAContext &context, co
+ 			break;
+ 		LOG(IPASoftAf, Debug) << "monitor " << frame << " " << value / reference_;
+ 		if (changed_ < 2) {
++			/*
++			 * Sharper at the same lens position is still in focus: after a scan the exposure settles and the
++			 * measure creeps up for a second or two (x1.5 by 2 s), which used to read as a new scene and
++			 * rescan every 2 s on a still subject. A rise only follows the reference up; a fall, or a jump
++			 * between two readings (the phone pointed elsewhere), is a change.
++			 */
+ 			const double ratio = value / reference_;
+-			changed_ = (ratio < kChangedLow || ratio > kChangedHigh) ? changed_ + 1 : 0;
++			const bool jumped = last_ > 0 && value > kChangedHigh * last_;
++			if (ratio < kChangedLow || jumped) {
++				changed_++;
++			} else {
++				changed_ = 0;
++				reference_ = std::max(reference_, value);
++			}
+ 		} else {
+ 			steady_ = std::abs(value - last_) < kSteady * last_ ? steady_ + 1 : 0;
+ 			if (steady_ >= 2) {
+--- a/src/ipa/simple/algorithms/af.h
++++ b/src/ipa/simple/algorithms/af.h
+@@ -57,6 +57,8 @@ private:
+ 	int32_t coarseStep_ = 0;
+ 	uint32_t movedAt_ = 0;
+ 	uint32_t settle_ = 3;
++	/* the settle and start times above in frames, at the configured frame rate */
++	uint32_t settleFrames_ = 6, settleLongFrames_ = 8, startFrames_ = 36;
+ 	int32_t approach_ = -1;	/* a position passed through on the way to the next target, or -1 */
+ 	bool waiting_ = false;
+ 

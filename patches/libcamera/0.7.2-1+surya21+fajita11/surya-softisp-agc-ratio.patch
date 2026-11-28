@@ -1,0 +1,120 @@
+Index: libcamera-0.7.2/src/ipa/simple/algorithms/agc.cpp
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/algorithms/agc.cpp
++++ libcamera-0.7.2/src/ipa/simple/algorithms/agc.cpp
+@@ -72,11 +72,22 @@ static constexpr float kExpProportionalG
+ /* the most digital gain the ISP adds on top of the sensor's longest exposure and highest gain */
+ static constexpr double kMaxDigitalGain = 4.0;
+ 
++/*
++ * Far from the target (an MSV error of kExposureFar or more) the exposure jumps by the ratio of the target mean to
++ * the measured mean, up to kExpMaxJump either way, and then waits until the sensor delivers it before the next jump.
++ * Turned towards a dark room, the 5-bin MSV reads 1.0 (all in the lowest bin), an error of exactly 1.0, which the
++ * proportional steps above treated as near: 4% a frame, and the picture stayed dark for many seconds.
++ */
++static constexpr float kExposureFar = 0.6;
++/* the mean (0..1 above black) that gives an MSV of about kExposureOptimal: MSV ~ 5 * mean + 0.5 */
++static constexpr double kMeanOptimal = 0.3;
++static constexpr double kExpMaxJump = 8.0;
++
+ Agc::Agc()
+ {
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV, double mean)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+@@ -86,6 +97,42 @@ void Agc::updateExposure(IPAContext &con
+ 	if (std::abs(error) <= kExposureSatisfactory)
+ 		return;
+ 
++	if (std::abs(error) >= kExposureFar) {
++		auto &state = context.activeState.agc;
++		const auto &cfg = context.configuration.agc;
++
++		/* the last jump has not reached the sensor yet (2-3 frames): keep asking for it */
++		if (std::abs(exposure - state.exposure) > 1 ||
++		    std::abs(again - state.again) > 0.05 * state.again) {
++			exposure = state.exposure;
++			again = state.again;
++			return;
++		}
++
++		const double factor = std::clamp(kMeanOptimal / std::max(mean, 0.002), 1.0 / kExpMaxJump, kExpMaxJump);
++		const double base = std::max(cfg.againMin, cfg.again10);
++		double &digital = state.digitalGain;
++		/* (the first frames can report 0 for both: start from the shortest exposure at unity gain) */
++		const double expMin = std::max(cfg.exposureMin, 1);
++		const double cur = std::max<double>(exposure, expMin) *
++				   (std::isfinite(again) ? std::max(again, base) : base) * std::max(digital, 1.0);
++		const double want = cur * factor;
++
++		/* exposure first, then analogue gain, then the ISP's digital gain (least noise) */
++		const double e = std::clamp(want / base, expMin, static_cast<double>(cfg.exposureMax));
++		exposure = static_cast<int32_t>(e);
++		again = std::clamp(want / exposure, cfg.againMin, cfg.againMax);
++		digital = std::clamp(want / (exposure * again), 1.0, kMaxDigitalGain);
++
++		state.exposure = exposure;
++		state.again = again;
++
++		LOG(IPASoftExposure, Debug)
++			<< "exposureMSV " << exposureMSV << " mean " << mean << " jump " << factor
++			<< " exp " << exposure << " again " << again << " digital " << digital;
++		return;
++	}
++
+ 	/*
+ 	 * Compute a proportional correction factor. The sign of the error
+ 	 * determines the direction: positive error means too dark (increase),
+@@ -201,6 +248,7 @@ void Agc::process(IPAContext &context,
+ 	int exposureBins[kExposureBinsCount] = {};
+ 	unsigned int denom = 0;
+ 	unsigned int num = 0;
++	double meanSum = 0.0;
+ 
+ 	if (yHistValsPerBin == 0) {
+ 		LOG(IPASoftExposure, Debug)
+@@ -211,6 +259,7 @@ void Agc::process(IPAContext &context,
+ 	for (unsigned int i = 0; i < histogramSize; i++) {
+ 		unsigned int idx = (i - (i / yHistValsPerBinMod)) / yHistValsPerBin;
+ 		exposureBins[idx] += histogram[blackLevelHistIdx + i];
++		meanSum += histogram[blackLevelHistIdx + i] * (i + 0.5);
+ 	}
+ 
+ 	for (unsigned int i = 0; i < kExposureBinsCount; i++) {
+@@ -220,7 +269,18 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++	double mean = (denom == 0 ? 0.0 : meanSum / denom / histogramSize);
++
++	/*
++	 * The statistics see the raw frame, before the ISP's digital gain: with that gain in use, judge the picture
++	 * by the mean it gives (MSV ~ 5 * mean + 0.5), or the gain went to its maximum in any dim room.
++	 */
++	const double digital = context.activeState.agc.digitalGain;
++	if (digital > 1.0) {
++		mean *= digital;
++		exposureMSV = std::clamp(5.0 * mean + 0.5, 1.0, 5.0);
++	}
++	updateExposure(context, frameContext, exposureMSV, mean);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+Index: libcamera-0.7.2/src/ipa/simple/algorithms/agc.h
+===================================================================
+--- libcamera-0.7.2.orig/src/ipa/simple/algorithms/agc.h
++++ libcamera-0.7.2/src/ipa/simple/algorithms/agc.h
+@@ -25,7 +25,7 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV, double mean);
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
