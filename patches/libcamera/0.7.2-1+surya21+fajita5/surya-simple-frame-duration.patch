@@ -1,0 +1,102 @@
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -374,6 +374,11 @@ private:
+ 	void metadataReady(uint32_t frame, const ControlList &metadata);
+ 	void setSensorControls(const ControlList &sensorControls);
+ 	void setLensControls(const ControlList &lensControls);
++
++public:
++	void applyFrameDuration(const ControlList &controls);
++	/* the frame duration last programmed into the sensor (its VBLANK), 0 = the mode's own */
++	int64_t frameDurationUs_ = 0;
+ };
+ 
+ class SimpleCameraConfiguration : public CameraConfiguration
+@@ -629,6 +634,19 @@ int SimpleCameraData::init()
+ 			swIsp_->metadataReady.connect(this, &SimpleCameraData::metadataReady);
+ 			swIsp_->setSensorControls.connect(this, &SimpleCameraData::setSensorControls);
+ 			swIsp_->setLensControls.connect(this, &SimpleCameraData::setLensControls);
++
++			/*
++			 * Frame rate control: without FrameDurationLimits PipeWire advertises no frame rate at all,
++			 * and an encoder that needs one (v4l2h264enc) cannot negotiate with the camera. 1-60 fps;
++			 * a mode that cannot go as fast runs at its own fastest.
++			 */
++			ControlInfoMap::Map map;
++			for (const auto &[id, info] : controlInfo_)
++				map.emplace(id, info);
++			map[&controls::FrameDurationLimits] =
++				ControlInfo(static_cast<int64_t>(16667), static_cast<int64_t>(1000000),
++					    static_cast<int64_t>(16667));
++			controlInfo_ = ControlInfoMap(std::move(map), controls::controls);
+ 		}
+ 	}
+ 
+@@ -1044,6 +1062,38 @@ void SimpleCameraData::metadataReady(uin
+ 	tryCompleteRequest(info->request);
+ }
+ 
++/*
++ * FrameDurationLimits as the sensor's frame length: its maximum duration over the configured mode's line time,
++ * clamped to what the mode allows, set as VBLANK (the sensor drivers write the frame length from it).
++ */
++void SimpleCameraData::applyFrameDuration(const ControlList &controls)
++{
++	const auto &limits = controls.get(controls::FrameDurationLimits);
++	if (!limits)
++		return;
++
++	const int64_t us = (*limits)[1];
++	if (us <= 0 || us == frameDurationUs_)
++		return;
++
++	IPACameraSensorInfo info;
++	if (sensor_->sensorInfo(&info) || !info.pixelRate || !info.minLineLength)
++		return;
++
++	const double line = static_cast<double>(info.minLineLength) / info.pixelRate;
++	int64_t frame = std::llround(us * 1e-6 / line);
++	frame = std::clamp<int64_t>(frame, info.minFrameLength, info.maxFrameLength);
++
++	ControlList ctrls(sensor_->controls());
++	ctrls.set(V4L2_CID_VBLANK, static_cast<int32_t>(frame - info.outputSize.height));
++	if (sensor_->setControls(&ctrls))
++		return;
++
++	frameDurationUs_ = us;
++	LOG(SimplePipeline, Debug) << "Frame duration " << us << " us: frame length " << frame
++				   << " (" << 1.0 / (frame * line) << " fps)";
++}
++
+ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ {
+ 	delayedCtrls_->push(sensorControls);
+@@ -1526,6 +1576,9 @@ int SimplePipelineHandler::configure(Cam
+ 	 * Configure links on the pipeline and propagate formats from the
+ 	 * sensor to the video node.
+ 	 */
++	/* a new mode starts at its own frame length (the sensor drivers reset VBLANK) */
++	data->frameDurationUs_ = 0;
++
+ 	ret = data->setupLinks();
+ 	if (ret < 0)
+ 		return ret;
+@@ -1692,6 +1745,9 @@ int SimplePipelineHandler::start(Camera
+ 						      &DelayedControls::applyControls);
+ 	}
+ 
++	if (controls)
++		data->applyFrameDuration(*controls);
++
+ 	ret = video->streamOn();
+ 	if (ret < 0) {
+ 		stop(camera);
+@@ -1775,6 +1831,8 @@ int SimplePipelineHandler::queueRequestD
+ 		}
+ 	}
+ 
++	data->applyFrameDuration(request->controls());
++
+ 	data->frameInfo_.create(request, metadataRequired);
+ 	if (data->useConversion_) {
+ 		data->conversionQueue_.push({ request, std::move(buffers) });
